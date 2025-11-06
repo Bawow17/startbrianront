@@ -1,10 +1,11 @@
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local GameConfig = require(Shared.Config.GameConfig)
 local GameLoopSignals = require(Shared.Signals.GameLoopSignals)
-local systemsFolder = script.Parent.Parent
+local systemsFolder = script.Parent
 local TankSystem = require(systemsFolder:WaitForChild("TankSystem"))
 local ProjectileSystem = require(systemsFolder:WaitForChild("ProjectileSystem"))
 
@@ -40,7 +41,12 @@ local function onHeartbeat(deltaTime)
 
 	if GameConfig.LogHeartbeat and os.clock() - lastLogged >= 5 then
 		lastLogged = os.clock()
-		print(string.format("[GameLoop] dt=%.4f accumulator=%.4f", deltaTime, accumulator))
+		local projectileCount = 0
+		if typeof(ProjectileSystem.getActiveCount) == "function" then
+			projectileCount = ProjectileSystem.getActiveCount()
+		end
+		local tankCount = #TankSystem.getActiveTanks()
+		print(string.format("[GameLoop] dt=%.4f accumulator=%.4f tanks=%d projectiles=%d", deltaTime, accumulator, tankCount, projectileCount))
 	end
 end
 
@@ -50,4 +56,19 @@ RunService.Heartbeat:Connect(onHeartbeat)
 
 TankSystem.start()
 ProjectileSystem.start()
+
+local debugConfig = GameConfig.Debug or {}
+if debugConfig.AutoSpawnBots and debugConfig.AutoSpawnBots > 0 then
+	local debugTools = ServerStorage:FindFirstChild("DebugTools")
+	if debugTools and debugTools:FindFirstChild("SpawnBots") then
+		local success, harness = pcall(require, debugTools.SpawnBots)
+		if success and harness then
+			task.defer(function()
+				harness.start(debugConfig.AutoSpawnBots)
+			end)
+		else
+			warn("[GameLoop] Failed to load debug bot harness:", harness)
+		end
+	end
+end
 
