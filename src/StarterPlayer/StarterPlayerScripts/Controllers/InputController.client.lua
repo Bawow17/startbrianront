@@ -11,6 +11,7 @@ local mouse = player:GetMouse()
 local remotesFolder = ReplicatedStorage:WaitForChild("Remotes")
 local remotes = require(remotesFolder:WaitForChild("InputEvents"))
 local playerInputRemote = remotes.PlayerInput
+local tankStateUpdateRemote = remotes.TankStateUpdate
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local TankComponents = require(Shared.Components.TankComponents)
@@ -28,6 +29,14 @@ local baseHeight
 local currentMoveDir = Vector3.zero
 local currentAimDir = Vector3.new(0, 0, -1)
 local shiftLocked = false
+
+-- Client-side prediction state
+local localTankPartOffsets = {} -- Store part offsets for local tank model
+local localTankPlayerPositionOffset = nil -- Store PlayerPosition offset for local tank
+local localTankOriginalRotation = CFrame.new().Rotation -- Store original rotation from model
+local serverPosition = nil -- Server's authoritative position for reconciliation
+local serverVelocity = Vector3.zero
+local serverFacing = 0
 
 local PLAYER_OFFSET = Vector3.new(0, 5, 0)
 local PLAYER_OFFSET_CF = CFrame.new(PLAYER_OFFSET)
@@ -111,9 +120,76 @@ local function cleanupLocalVisual()
 	end
 end
 
+local function updateLocalTankModelPosition(rootPos)
+	-- Update tank model position to maintain structure relative to root
+	-- Similar to server's updateTankModelPosition function
+	if not currentTank or not currentTank:IsA("Model") then
+		return
+	end
+	
+	local primary = currentTank.PrimaryPart
+	if not primary or not localTankPartOffsets or not localTankPlayerPositionOffset then
+		return
+	end
+	
+	local playerPositionOffset = localTankPlayerPositionOffset
+	-- Get tank facing direction from client prediction
+	-- Extract Y rotation from original rotation
+	local _, originalY, _ = localTankOriginalRotation:ToEulerAnglesXYZ()
+	local tankRotation = CFrame.Angles(0, originalY + facing, 0)
+	
+	-- Rotate the offset by current facing direction to get world-space offset
+	local rotatedOffset = tankRotation * CFrame.new(playerPositionOffset)
+	local worldOffset = rotatedOffset.Position
+	
+	-- Calculate tank center position: root - rotated offset, but Y=0
+	local tankCenterPos = rootPos - worldOffset
+	-- Account for PrimaryPart's pivot being at its center
+	local primarySizeY = primary.Size.Y
+	local pivotOffsetY = primarySizeY / 2
+	tankCenterPos = Vector3.new(tankCenterPos.X, pivotOffsetY, tankCenterPos.Z)
+	
+	-- Update PrimaryPart position and rotation
+	local tankCenterCF = CFrame.new(tankCenterPos) * tankRotation
+	primary.CFrame = tankCenterCF
+	
+	-- Update all other parts' positions relative to PrimaryPart
+	for part, offset in pairs(localTankPartOffsets) do
+		if part ~= primary then
+			local partCF = primary.CFrame * offset
+			part.CFrame = partCF
+		end
+	end
+end
+
 local function createLocalTankVisual()
 	if not rootPart then
 		return
+	end
+
+	-- Store tank model offsets when creating visual
+	if currentTank and currentTank:IsA("Model") then
+		local primary = currentTank.PrimaryPart
+		if primary then
+			-- Store original rotation
+			localTankOriginalRotation = primary.CFrame.Rotation
+			
+			-- Find PlayerPosition part and calculate offset
+			local playerPosPart = currentTank:FindFirstChild("PlayerPosition")
+			if playerPosPart and playerPosPart:IsA("BasePart") then
+				local primaryToPlayerPos = primary.CFrame:ToObjectSpace(playerPosPart.CFrame)
+				localTankPlayerPositionOffset = primaryToPlayerPos.Position
+			end
+			
+			-- Store relative positions of all parts to PrimaryPart
+			localTankPartOffsets = {}
+			for _, descendant in ipairs(currentTank:GetDescendants()) do
+				if descendant:IsA("BasePart") then
+					local offset = primary.CFrame:ToObjectSpace(descendant.CFrame)
+					localTankPartOffsets[descendant] = offset
+				end
+			end
+		end
 	end
 
 	if currentTank then
@@ -334,10 +410,11 @@ local function onCharacterAdded(character)
 	applyShiftLock(false)
 
 	if rootPart then
-		-- Server is authoritative for character position
-		-- Client should NOT anchor or modify root part - server handles it
+		-- Client-side prediction: Client will update root part position
+		-- Server validates and sends corrections when needed
 		rootPart.CanTouch = false
 		rootPart.CanCollide = false
+		rootPart.Anchored = true -- Anchor for client-side control
 		for _, descendant in ipairs(character:GetDescendants()) do
 			if descendant:IsA("BasePart") then
 				descendant.CanTouch = false
@@ -619,10 +696,45 @@ local function integrateMovement(deltaTime)
 	local aimDirection = aimDir.Magnitude > EPSILON and aimDir.Unit or Vector3.new(0, 0, -1)
 	facing = math.atan2(-aimDirection.X, -aimDirection.Z)
 
-	-- Client only processes input and sends to server
-	-- Server is authoritative for character position
-	-- No position updates on client - server handles all movement
+	-- Client-side prediction: Apply movement updates immediately
+	-- Server will validate and send corrections if needed
+	if rootPart and rootPart.Parent then
+		-- Ensure root is anchored for client-side control
+		if not rootPart.Anchored then
+			rootPart.Anchored = true
+		end
+		
+		-- Update character root position with predicted position
+		local characterCFrame = CFrame.lookAt(position, position + aimDirection)
+		rootPart.CFrame = characterCFrame
+		
+		-- Update tank model position relative to root
+		updateLocalTankModelPosition(position)
+	end
+end
 
+local function reconcileWithServer()
+	-- Tolerance-based reconciliation: only correct if difference > 1 stud
+	if not serverPosition or not position then
+		return
+	end
+	
+	local difference = (serverPosition - position).Magnitude
+	if difference > 1.0 then
+		-- Smoothly lerp toward server position
+		local lerpFactor = 0.15 -- Smooth correction factor
+		position = position:Lerp(serverPosition, lerpFactor)
+		velocity = velocity:Lerp(serverVelocity, lerpFactor)
+		facing = facing + (serverFacing - facing) * lerpFactor
+		
+		-- Update root part position
+		if rootPart and rootPart.Parent then
+			local aimDirection = Vector3.new(math.sin(facing), 0, math.cos(facing))
+			local characterCFrame = CFrame.lookAt(position, position + aimDirection)
+			rootPart.CFrame = characterCFrame
+			updateLocalTankModelPosition(position)
+		end
+	end
 end
 
 local function payloadChanged(newPayload)
@@ -697,8 +809,31 @@ UserInputService.InputEnded:Connect(function(input)
 	end
 end)
 
+-- Listen for server state updates
+tankStateUpdateRemote.OnClientEvent:Connect(function(updates)
+	if not updates or type(updates) ~= "table" then
+		return
+	end
+	
+	for _, update in ipairs(updates) do
+		if update.PlayerId == player.UserId then
+			-- This is the local player - store for reconciliation
+			serverPosition = update.Position
+			serverVelocity = update.Velocity
+			serverFacing = update.Facing or 0
+		else
+			-- This is another player - handle interpolation (will implement next)
+			-- TODO: Add other players interpolation
+		end
+	end
+end)
+
 RunService.RenderStepped:Connect(function(deltaTime)
 	integrateMovement(deltaTime)
+	
+	-- Reconcile with server if needed
+	reconcileWithServer()
+	
 	sendAccumulator += deltaTime
 	if sendAccumulator >= REMOTE_SEND_INTERVAL then
 		sendAccumulator = 0

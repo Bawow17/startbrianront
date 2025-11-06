@@ -250,9 +250,6 @@ local function updateTankModelPosition(tank, rootPos)
 	local tankCenterCF = CFrame.new(tankCenterPos) * tankRotation
 	primary.CFrame = tankCenterCF
 	
-	-- Debug: Verify PrimaryPart is at Y=0
-	print(string.format("[TankSystem] Tank center (PrimaryPart) Y: %.3f (should be 0.000)", primary.CFrame.Position.Y))
-	
 	-- Update all other parts' positions relative to PrimaryPart to maintain model structure
 	for part, offset in pairs(tank.partOffsets) do
 		if part ~= primary then
@@ -281,10 +278,11 @@ local function attachCharacter(record, character)
 
 	-- Initial positioning will be done after calculating offset and positioning tank
 	-- For now, just set initial position from spawn
+	-- Note: Client will take over root control via client-side prediction
 	root.CFrame = record.spawnCFrame or CFrame.new(record.movement.Position)
 	root.AssemblyLinearVelocity = Vector3.zero
 	root.AssemblyAngularVelocity = Vector3.zero
-	root.Anchored = true
+	root.Anchored = true -- Client will also anchor it, but set here for initial state
 	record.characterRoot = root
 	record.character = character
 	
@@ -296,7 +294,6 @@ local function attachCharacter(record, character)
 		-- Step 1: Calculate PlayerPosition offset from tank center BEFORE moving tank
 		local playerPosPart = nil
 		local playerPositionOffset = nil -- Offset from tank center (PrimaryPart) to PlayerPosition
-		local playerPositionWorldPos = nil -- PlayerPosition world position before moving
 		
 		if record.model:IsA("Model") then
 			local primary = record.model.PrimaryPart
@@ -315,14 +312,9 @@ local function attachCharacter(record, character)
 					-- Calculate offset from PrimaryPart (tank center) to PlayerPosition in object space
 					local primaryToPlayerPos = primary.CFrame:ToObjectSpace(playerPosPart.CFrame)
 					playerPositionOffset = primaryToPlayerPos.Position
-					playerPositionWorldPos = playerPosPart.CFrame.Position
 					
 					-- Store tank center rotation for later use
 					record.tankCenterRotation = primary.CFrame.Rotation
-					
-					print(string.format("[TankSystem] DEBUG: PlayerPosition offset from tank center: %s", tostring(playerPositionOffset)))
-					print(string.format("[TankSystem] DEBUG: PlayerPosition world position (before move): %s", tostring(playerPositionWorldPos)))
-					print(string.format("[TankSystem] DEBUG: Tank center (PrimaryPart) at: %s", tostring(primary.CFrame.Position)))
 				end
 			end
 		end
@@ -376,9 +368,6 @@ local function attachCharacter(record, character)
 				
 				-- Set PrimaryPart CFrame directly
 				primary.CFrame = tankCenterCF
-				
-				-- Debug: Verify PrimaryPart is at Y=0 after initial positioning
-				print(string.format("[TankSystem] Initial tank center (PrimaryPart) Y: %.3f (should be 0.000)", primary.CFrame.Position.Y))
 				
 				-- Update all other parts' positions relative to PrimaryPart to maintain model structure
 				for part, offset in pairs(partOffsets) do
@@ -541,38 +530,11 @@ local function updateMovement(tank, deltaTime)
 		simulateTankPhysics(tank, deltaTime)
 		updateFacing(tank)
 		
-		if tank.characterRoot then
-			local root = tank.characterRoot
-			-- Update character root position based on movement state
-			local aimDir = tank.input.AimDirection
-			local aimDirection = aimDir.Magnitude > 0.001 and aimDir.Unit or Vector3.new(0, 0, -1)
-			local characterCFrame = CFrame.lookAt(movement.Position, movement.Position + aimDirection)
-			root.CFrame = characterCFrame
-			
-			-- Update tank model position relative to root
-			updateTankModelPosition(tank, root.Position)
-		elseif tank.model then
-			local modelPos
-			if tank.model:IsA("Model") then
-				local primary = tank.model.PrimaryPart
-				if primary then
-					modelPos = primary.Position
-				else
-					local fallback = tank.model:FindFirstChildOfClass("BasePart")
-					if fallback then
-						modelPos = fallback.Position
-					end
-				end
-			else
-				modelPos = tank.model.Position
-			end
-			if modelPos then
-				movement.Position = modelPos
-			end
-		end
-		updateFacing(tank)
-		-- Tank model is welded to player root, so it follows automatically
-		-- We only need to update rotation if needed, but WeldConstraint handles position
+		-- Server simulates physics for validation but does NOT update root or tank model directly
+		-- Client handles all visual updates via client-side prediction for local player
+		-- For other players: They will be updated by their own clients
+		-- Server only simulates physics and sends state updates - no visual updates
+		-- This prevents conflicts between server and client updates
 	end
 end
 
@@ -682,6 +644,25 @@ function TankSystem.getTankByKey(key)
 	return tanksByKey[key]
 end
 
+local function sendStateUpdates()
+	-- Broadcast position/velocity/facing updates for all players at 60fps
+	local updates = {}
+	for _, tank in ipairs(activeTanks) do
+		if tank.player and tank.movement then
+			table.insert(updates, {
+				PlayerId = tank.player.UserId,
+				Position = tank.movement.Position,
+				Velocity = tank.movement.Velocity,
+				Facing = tank.movement.Facing or 0,
+			})
+		end
+	end
+	
+	if #updates > 0 then
+		InputEvents.TankStateUpdate:FireAllClients(updates)
+	end
+end
+
 function TankSystem.start()
 	if isRunning then
 		return
@@ -690,7 +671,11 @@ function TankSystem.start()
 
 	connections[#connections + 1] = Players.PlayerAdded:Connect(onPlayerAdded)
 	connections[#connections + 1] = Players.PlayerRemoving:Connect(onPlayerRemoving)
-	connections[#connections + 1] = GameLoopSignals.FixedStep:Connect(onFixedStep)
+	connections[#connections + 1] = GameLoopSignals.FixedStep:Connect(function(deltaTime)
+		onFixedStep(deltaTime)
+		-- Send state updates after each fixed step (60fps)
+		sendStateUpdates()
+	end)
 	connections[#connections + 1] = InputEvents.PlayerInput.OnServerEvent:Connect(function(player, payload)
 		if typeof(payload) ~= "table" then
 			return
