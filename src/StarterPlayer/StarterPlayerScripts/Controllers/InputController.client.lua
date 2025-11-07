@@ -29,6 +29,12 @@ local baseHeight
 local currentMoveDir = Vector3.zero
 local currentAimDir = Vector3.new(0, 0, -1)
 local shiftLocked = false
+local lastAppliedFacing = nil -- Track last applied facing to avoid unnecessary updates
+local MIN_FACING_CHANGE = math.rad(0.5) -- Only update rotation if facing changes by more than 0.5 degrees
+
+-- Aim direction smoothing to prevent rapid flips
+local MIN_AIM_DISTANCE = 1.0 -- Minimum distance for mouse hit to be valid
+local MIN_PLANAR_MAGNITUDE = 0.01 -- Minimum planar magnitude to avoid unstable atan2
 
 -- Client-side prediction state
 local localTankPartOffsets = {} -- Store part offsets for local tank model
@@ -37,6 +43,16 @@ local localTankOriginalRotation = CFrame.new().Rotation -- Store original rotati
 local serverPosition = nil -- Server's authoritative position for reconciliation
 local serverVelocity = Vector3.zero
 local serverFacing = 0
+
+-- Reconciliation smoothing state
+local serverPositionBuffer = {} -- Buffer for smoothing server position updates
+local MAX_BUFFER_SIZE = 5 -- Store last 5 server positions
+local lastReconciliationTime = 0 -- Time of last reconciliation
+local RECONCILIATION_COOLDOWN = 0.2 -- Minimum seconds between reconciliations
+local RECONCILIATION_TOLERANCE = 1.5 -- Minimum difference (studs) to trigger reconciliation
+local MIN_DIFFERENCE_THRESHOLD = 0.1 -- Ignore differences smaller than this
+local reconciliationFrameCounter = 0 -- Frame counter for reduced frequency checks
+local RECONCILIATION_CHECK_INTERVAL = 3 -- Check every N frames
 
 local PLAYER_OFFSET = Vector3.new(0, 5, 0)
 local PLAYER_OFFSET_CF = CFrame.new(PLAYER_OFFSET)
@@ -585,12 +601,15 @@ local function getMoveVector()
 end
 
 local function getAimDirection()
+	-- Use rootPart position as origin for stability during movement
+	-- This prevents rapid changes in origin from causing aim direction flips
 	local origin
-	if position then
-		origin = position
-	elseif rootPart and rootPart.Parent then
-		-- Player root is at the position (PlayerPosition aligns with root)
+	if rootPart and rootPart.Parent then
+		-- Use actual rendered position instead of predicted position for stability
 		origin = rootPart.CFrame.Position
+	elseif position then
+		-- Fallback to predicted position if rootPart not available
+		origin = position
 	elseif currentTank then
 		if currentTank:IsA("Model") then
 			local primary = currentTank.PrimaryPart
@@ -621,9 +640,13 @@ local function getAimDirection()
 		if hit then
 			local diff = hit.Position - origin
 			local planar = Vector3.new(diff.X, 0, diff.Z)
-			if planar.Magnitude > EPSILON then
+			local planarDistance = planar.Magnitude
+			-- Only use mouse hit if planar distance is far enough to avoid instability
+			-- This prevents issues when mouse is pointing directly at/near player position
+			if planarDistance > MIN_AIM_DISTANCE and planarDistance > MIN_PLANAR_MAGNITUDE then
 				return planar.Unit
 			end
+			-- If too close, fall through to camera look vector to avoid instability
 		end
 	end
 
@@ -692,9 +715,80 @@ local function integrateMovement(deltaTime)
 
 	currentMoveDir = moveDir
 	local aimDir = getAimDirection()
+	
+	-- Validate aim direction magnitude to prevent unstable calculations
+	if aimDir.Magnitude < MIN_PLANAR_MAGNITUDE then
+		-- Use previous aim direction if current one is too small
+		aimDir = currentAimDir.Magnitude > MIN_PLANAR_MAGNITUDE and currentAimDir or Vector3.new(0, 0, -1)
+	end
+	
+	-- Smooth aim direction during movement to prevent rapid flips
+	-- Only smooth if we're moving and the direction change is significant
+	local isMoving = moveDir.Magnitude > 0.01
+	if isMoving and currentAimDir.Magnitude > MIN_PLANAR_MAGNITUDE and aimDir.Magnitude > MIN_PLANAR_MAGNITUDE then
+		local currentUnit = currentAimDir.Unit
+		local newUnit = aimDir.Unit
+		-- Calculate angle between old and new direction
+		local dot = currentUnit:Dot(newUnit)
+		-- Clamp dot to valid range for acos
+		dot = math.clamp(dot, -1, 1)
+		local angle = math.acos(dot)
+		
+		-- If the angle change is large (>45 degrees), it might be a flip
+		-- In that case, smooth it out during movement
+		if angle > math.rad(45) then
+			-- During movement, limit rapid direction changes
+			-- Smooth towards new direction but prevent sudden flips
+			local smoothFactor = 0.25 -- How quickly to adapt (lower = smoother, prevents flips)
+			local smoothed = (currentUnit * (1 - smoothFactor) + newUnit * smoothFactor)
+			-- Normalize the smoothed direction vector
+			local smoothedMag = smoothed.Magnitude
+			if smoothedMag > MIN_PLANAR_MAGNITUDE then
+				aimDir = (smoothed / smoothedMag)
+			end
+		end
+	end
+	
 	currentAimDir = aimDir
-	local aimDirection = aimDir.Magnitude > EPSILON and aimDir.Unit or Vector3.new(0, 0, -1)
-	facing = math.atan2(-aimDirection.X, -aimDirection.Z)
+	local aimDirection = aimDir.Unit
+	
+	-- Calculate new facing angle only if aim direction is valid
+	-- Check magnitude before using atan2 to prevent instability
+	if aimDirection.Magnitude < 0.9 then
+		-- Invalid direction, keep current facing
+		aimDirection = Vector3.new(-math.sin(facing or 0), 0, -math.cos(facing or 0))
+	else
+		-- Calculate new facing angle
+		local newFacing = math.atan2(-aimDirection.X, -aimDirection.Z)
+		
+		-- Normalize angle difference to prevent 180-degree flips
+		-- If the difference is > π, wrap it to the shorter path
+		if facing then
+			local angleDiff = newFacing - facing
+			-- Normalize angle difference to [-π, π]
+			while angleDiff > math.pi do
+				angleDiff -= 2 * math.pi
+			end
+			while angleDiff < -math.pi do
+				angleDiff += 2 * math.pi
+			end
+			
+			-- Ignore extremely large angle differences (likely errors)
+			-- This prevents 180-degree flips from numerical instability
+			if math.abs(angleDiff) < math.pi * 0.9 then
+				-- Apply smooth transition to prevent sudden flips
+				facing = facing + angleDiff
+			end
+			-- If angleDiff is > 0.9π, ignore it (likely a calculation error)
+		else
+			facing = newFacing
+		end
+	end
+	
+	-- Reconstruct aim direction from normalized facing angle to prevent flips
+	-- facing = atan2(-aimDirection.X, -aimDirection.Z), so we reverse the signs
+	-- This ensures consistency between facing angle and visual representation
+	local normalizedAimDirection = Vector3.new(-math.sin(facing), 0, -math.cos(facing))
 
 	-- Client-side prediction: Apply movement updates immediately
 	-- Server will validate and send corrections if needed
@@ -704,34 +798,117 @@ local function integrateMovement(deltaTime)
 			rootPart.Anchored = true
 		end
 		
-		-- Update character root position with predicted position
-		local characterCFrame = CFrame.lookAt(position, position + aimDirection)
-		rootPart.CFrame = characterCFrame
+		-- Check if facing angle has changed significantly before updating rotation
+		-- This prevents jitter from tiny floating-point changes
+		local shouldUpdateRotation = true
+		if lastAppliedFacing ~= nil then
+			local facingDiff = math.abs(facing - lastAppliedFacing)
+			-- Normalize to [-π, π]
+			if facingDiff > math.pi then
+				facingDiff = 2 * math.pi - facingDiff
+			end
+			-- Only update if change is significant
+			if facingDiff < MIN_FACING_CHANGE then
+				shouldUpdateRotation = false
+			end
+		end
+		
+		-- Only update rotation if it has changed significantly
+		-- This prevents jitter from updating rotation every frame
+		local newCFrame
+		if shouldUpdateRotation then
+			-- Update both position and rotation
+			newCFrame = CFrame.lookAt(position, position + normalizedAimDirection)
+			lastAppliedFacing = facing
+		else
+			-- Keep current rotation, only update position
+			local currentRotation = rootPart.CFrame.Rotation
+			newCFrame = CFrame.new(position) * currentRotation
+		end
+		
+		rootPart.CFrame = newCFrame
 		
 		-- Update tank model position relative to root
 		updateLocalTankModelPosition(position)
 	end
 end
 
+local function getSmoothedServerPosition()
+	-- Calculate weighted average of server position buffer
+	if #serverPositionBuffer == 0 then
+		return serverPosition
+	end
+	
+	local totalWeight = 0
+	local weightedSum = Vector3.zero
+	
+	for i = 1, #serverPositionBuffer do
+		-- Most recent positions get higher weight
+		local weight = i / #serverPositionBuffer
+		totalWeight += weight
+		weightedSum += serverPositionBuffer[i] * weight
+	end
+	
+	if totalWeight > 0 then
+		return weightedSum / totalWeight
+	end
+	
+	return serverPosition
+end
+
 local function reconcileWithServer()
-	-- Tolerance-based reconciliation: only correct if difference > 1 stud
+	-- Check reconciliation frequency - only check every N frames
+	reconciliationFrameCounter += 1
+	if reconciliationFrameCounter < RECONCILIATION_CHECK_INTERVAL then
+		return
+	end
+	reconciliationFrameCounter = 0
+	
+	-- Check cooldown - don't reconcile too frequently
+	local currentTime = tick()
+	if currentTime - lastReconciliationTime < RECONCILIATION_COOLDOWN then
+		return
+	end
+	
 	if not serverPosition or not position then
 		return
 	end
 	
-	local difference = (serverPosition - position).Magnitude
-	if difference > 1.0 then
-		-- Smoothly lerp toward server position
-		local lerpFactor = 0.15 -- Smooth correction factor
-		position = position:Lerp(serverPosition, lerpFactor)
-		velocity = velocity:Lerp(serverVelocity, lerpFactor)
-		facing = facing + (serverFacing - facing) * lerpFactor
+	-- Get smoothed server position instead of raw position
+	local smoothedServerPos = getSmoothedServerPosition()
+	if not smoothedServerPos then
+		return
+	end
+	
+	local difference = (smoothedServerPos - position).Magnitude
+	
+	-- Skip if difference is too small (floating-point precision issues)
+	if difference < MIN_DIFFERENCE_THRESHOLD then
+		return
+	end
+	
+	-- Only reconcile if difference exceeds tolerance threshold
+	if difference > RECONCILIATION_TOLERANCE then
+		lastReconciliationTime = currentTime
 		
-		-- Update root part position
+		-- Adaptive lerp factor based on difference magnitude
+		-- Smaller differences = smaller lerp (smoother)
+		-- Larger differences = larger lerp (faster correction)
+		local baseLerpFactor = 0.1
+		local maxLerpFactor = 0.3
+		local lerpFactor = math.clamp(baseLerpFactor + (difference - RECONCILIATION_TOLERANCE) * 0.05, baseLerpFactor, maxLerpFactor)
+		
+		-- Only reconcile position - don't interfere with velocity/facing prediction
+		-- This allows client to continue predicting smoothly
+		position = position:Lerp(smoothedServerPos, lerpFactor)
+		
+		-- Update root part position only (don't change rotation during reconciliation)
+		-- Rotation should only be updated by integrateMovement based on aim direction
 		if rootPart and rootPart.Parent then
-			local aimDirection = Vector3.new(math.sin(facing), 0, math.cos(facing))
-			local characterCFrame = CFrame.lookAt(position, position + aimDirection)
-			rootPart.CFrame = characterCFrame
+			-- Keep current rotation, only update position
+			local currentRotation = rootPart.CFrame.Rotation
+			local newCFrame = CFrame.new(position) * currentRotation
+			rootPart.CFrame = newCFrame
 			updateLocalTankModelPosition(position)
 		end
 	end
@@ -817,8 +994,17 @@ tankStateUpdateRemote.OnClientEvent:Connect(function(updates)
 	
 	for _, update in ipairs(updates) do
 		if update.PlayerId == player.UserId then
-			-- This is the local player - store for reconciliation
-			serverPosition = update.Position
+			-- This is the local player - store for reconciliation with smoothing
+			local newServerPos = update.Position
+			
+			-- Add to position buffer for smoothing
+			table.insert(serverPositionBuffer, newServerPos)
+			if #serverPositionBuffer > MAX_BUFFER_SIZE then
+				table.remove(serverPositionBuffer, 1)
+			end
+			
+			-- Store latest raw position
+			serverPosition = newServerPos
 			serverVelocity = update.Velocity
 			serverFacing = update.Facing or 0
 		else
