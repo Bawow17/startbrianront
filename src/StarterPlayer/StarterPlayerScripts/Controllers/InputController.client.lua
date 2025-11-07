@@ -3,15 +3,15 @@ local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local REMOTE_SEND_INTERVAL = 1 / 15
+local REMOTE_SEND_INTERVAL = 1 / 60
 local MAX_DELTA = 0.05
 
 local player = Players.LocalPlayer
 local mouse = player:GetMouse()
 local remotesFolder = ReplicatedStorage:WaitForChild("Remotes")
 local remotes = require(remotesFolder:WaitForChild("InputEvents"))
-local playerInputRemote = remotes.PlayerInput
 local tankStateUpdateRemote = remotes.TankStateUpdate
+local tankClientStateRemote = remotes.TankClientState
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local TankComponents = require(Shared.Components.TankComponents)
@@ -30,7 +30,7 @@ local currentMoveDir = Vector3.zero
 local currentAimDir = Vector3.new(0, 0, -1)
 local shiftLocked = false
 local lastAppliedFacing = nil -- Track last applied facing to avoid unnecessary updates
-local MIN_FACING_CHANGE = math.rad(0.5) -- Only update rotation if facing changes by more than 0.5 degrees
+local MIN_FACING_CHANGE = math.rad(0.5)
 
 -- Aim direction smoothing to prevent rapid flips
 local MIN_AIM_DISTANCE = 1.0 -- Minimum distance for mouse hit to be valid
@@ -40,41 +40,21 @@ local MIN_PLANAR_MAGNITUDE = 0.01 -- Minimum planar magnitude to avoid unstable 
 local localTankPartOffsets = {} -- Store part offsets for local tank model
 local localTankPlayerPositionOffset = nil -- Store PlayerPosition offset for local tank
 local localTankOriginalRotation = CFrame.new().Rotation -- Store original rotation from model
+local localTankFacingOffset = 0
 local serverPosition = nil -- Server's authoritative position for reconciliation
-local serverVelocity = Vector3.zero
-local serverFacing = 0
 
--- Reconciliation smoothing state
-local serverPositionBuffer = {} -- Buffer for smoothing server position updates
-local MAX_BUFFER_SIZE = 5 -- Store last 5 server positions
-local lastReconciliationTime = 0 -- Time of last reconciliation
-local RECONCILIATION_COOLDOWN = 0.2 -- Minimum seconds between reconciliations
-local RECONCILIATION_TOLERANCE = 1.5 -- Minimum difference (studs) to trigger reconciliation
-local MIN_DIFFERENCE_THRESHOLD = 0.1 -- Ignore differences smaller than this
-local reconciliationFrameCounter = 0 -- Frame counter for reduced frequency checks
-local RECONCILIATION_CHECK_INTERVAL = 3 -- Check every N frames
+local DEBUG_MOVEMENT = true
+local DEBUG_REPORT_INTERVAL = 0.5
 
-local PLAYER_OFFSET = Vector3.new(0, 5, 0)
-local PLAYER_OFFSET_CF = CFrame.new(PLAYER_OFFSET)
+local debugLastReport = 0
+local debugCurrentPredictionDiff = 0
+local debugMaxPredictionDiff = 0
+local debugCurrentServerDelta = 0
+local debugMaxServerDelta = 0
+local debugLastCorrectionDiff = 0
+local debugCorrectionCount = 0
 
-local function parsePlayerOffset(offsetString)
-	if not offsetString or offsetString == "" then
-		return PLAYER_OFFSET
-	end
-	local parts = {}
-	for part in offsetString:gmatch("[^,]+") do
-		table.insert(parts, tonumber(part))
-	end
-	if #parts == 3 then
-		return Vector3.new(parts[1], parts[2], parts[3])
-	end
-	return PLAYER_OFFSET
-end
-
-local function getPlayerOffsetFromAttribute()
-	local offsetString = player:GetAttribute("TankPlayerOffset")
-	return parsePlayerOffset(offsetString)
-end
+local inputSequence = 0
 
 local function applyShiftLock(enabled)
 	shiftLocked = enabled
@@ -107,10 +87,7 @@ local moveBindings = {
 local moveState = {}
 local isFiring = false
 local sendAccumulator = 0
-local lastPayload = nil
 local EPSILON = 1e-4
-
-local TANK_VISUAL_OFFSET = Vector3.new(0, 5, 0)
 
 local DEFAULT_TANK_ANIMATION_ID = nil
 local currentAnimationTrack
@@ -149,10 +126,9 @@ local function updateLocalTankModelPosition(rootPos)
 	end
 	
 	local playerPositionOffset = localTankPlayerPositionOffset
-	-- Get tank facing direction from client prediction
-	-- Extract Y rotation from original rotation
-	local _, originalY, _ = localTankOriginalRotation:ToEulerAnglesXYZ()
-	local tankRotation = CFrame.Angles(0, originalY + facing, 0)
+	local baseRotation = localTankOriginalRotation
+	local facingOffset = localTankFacingOffset or 0
+	local tankRotation = CFrame.Angles(0, facing - facingOffset, 0) * baseRotation
 	
 	-- Rotate the offset by current facing direction to get world-space offset
 	local rotatedOffset = tankRotation * CFrame.new(playerPositionOffset)
@@ -189,6 +165,8 @@ local function createLocalTankVisual()
 		if primary then
 			-- Store original rotation
 			localTankOriginalRotation = primary.CFrame.Rotation
+			local baseLook = localTankOriginalRotation * Vector3.new(0, 0, -1)
+			localTankFacingOffset = math.atan2(-baseLook.X, -baseLook.Z) + math.rad(90)
 			
 			-- Find PlayerPosition part and calculate offset
 			local playerPosPart = currentTank:FindFirstChild("PlayerPosition")
@@ -208,32 +186,20 @@ local function createLocalTankVisual()
 		end
 	end
 
+	-- Ensure the live server model is visible for the local player
 	if currentTank then
 		if currentTank:IsA("Model") then
 			for _, part in ipairs(currentTank:GetDescendants()) do
 				if part:IsA("BasePart") then
-					part.LocalTransparencyModifier = 1
+					part.LocalTransparencyModifier = 0
 				end
 			end
 		else
-			currentTank.LocalTransparencyModifier = 1
+			currentTank.LocalTransparencyModifier = 0
 		end
 	end
 
-	-- Hide server model from local player using LocalTransparencyModifier
-	-- The server model is now a child of the player's character, so we just need to hide it
-	-- and the tank will naturally follow the character
-	if currentTank and currentTank:IsA("Model") then
-		for _, part in ipairs(currentTank:GetDescendants()) do
-			if part:IsA("BasePart") then
-				part.LocalTransparencyModifier = 1
-			end
-		end
-	else
-		-- No tank model available - don't create fallback sphere
-		-- The server model should always exist for players
-		warn("[InputController] No tank model found for local player")
-	end
+	localTankVisual = currentTank
 end
 
 local function stopCurrentAnimation()
@@ -793,6 +759,23 @@ local function integrateMovement(deltaTime)
 	-- Client-side prediction: Apply movement updates immediately
 	-- Server will validate and send corrections if needed
 	if rootPart and rootPart.Parent then
+		if DEBUG_MOVEMENT then
+			local actualPosition = rootPart.CFrame.Position
+			local predictedDelta = (position - actualPosition).Magnitude
+			debugCurrentPredictionDiff = predictedDelta
+			if predictedDelta > debugMaxPredictionDiff then
+				debugMaxPredictionDiff = predictedDelta
+			end
+			if serverPosition then
+				local serverDelta = (position - serverPosition).Magnitude
+				debugCurrentServerDelta = serverDelta
+				if serverDelta > debugMaxServerDelta then
+					debugMaxServerDelta = serverDelta
+				end
+				debugLastCorrectionDiff = serverDelta
+				debugCorrectionCount = inputSequence
+			end
+		end
 		-- Ensure root is anchored for client-side control
 		if not rootPart.Anchored then
 			rootPart.Anchored = true
@@ -833,134 +816,26 @@ local function integrateMovement(deltaTime)
 	end
 end
 
-local function getSmoothedServerPosition()
-	-- Calculate weighted average of server position buffer
-	if #serverPositionBuffer == 0 then
-		return serverPosition
+local function sendInput(elapsedDelta)
+	if not position then
+		return
 	end
-	
-	local totalWeight = 0
-	local weightedSum = Vector3.zero
-	
-	for i = 1, #serverPositionBuffer do
-		-- Most recent positions get higher weight
-		local weight = i / #serverPositionBuffer
-		totalWeight += weight
-		weightedSum += serverPositionBuffer[i] * weight
-	end
-	
-	if totalWeight > 0 then
-		return weightedSum / totalWeight
-	end
-	
-	return serverPosition
-end
 
-local function reconcileWithServer()
-	-- Check reconciliation frequency - only check every N frames
-	reconciliationFrameCounter += 1
-	if reconciliationFrameCounter < RECONCILIATION_CHECK_INTERVAL then
-		return
-	end
-	reconciliationFrameCounter = 0
-	
-	-- Check cooldown - don't reconcile too frequently
-	local currentTime = tick()
-	if currentTime - lastReconciliationTime < RECONCILIATION_COOLDOWN then
-		return
-	end
-	
-	if not serverPosition or not position then
-		return
-	end
-	
-	-- Get smoothed server position instead of raw position
-	local smoothedServerPos = getSmoothedServerPosition()
-	if not smoothedServerPos then
-		return
-	end
-	
-	local difference = (smoothedServerPos - position).Magnitude
-	
-	-- Skip if difference is too small (floating-point precision issues)
-	if difference < MIN_DIFFERENCE_THRESHOLD then
-		return
-	end
-	
-	-- Only reconcile if difference exceeds tolerance threshold
-	if difference > RECONCILIATION_TOLERANCE then
-		lastReconciliationTime = currentTime
-		
-		-- Adaptive lerp factor based on difference magnitude
-		-- Smaller differences = smaller lerp (smoother)
-		-- Larger differences = larger lerp (faster correction)
-		local baseLerpFactor = 0.1
-		local maxLerpFactor = 0.3
-		local lerpFactor = math.clamp(baseLerpFactor + (difference - RECONCILIATION_TOLERANCE) * 0.05, baseLerpFactor, maxLerpFactor)
-		
-		-- Only reconcile position - don't interfere with velocity/facing prediction
-		-- This allows client to continue predicting smoothly
-		position = position:Lerp(smoothedServerPos, lerpFactor)
-		
-		-- Update root part position only (don't change rotation during reconciliation)
-		-- Rotation should only be updated by integrateMovement based on aim direction
-		if rootPart and rootPart.Parent then
-			-- Keep current rotation, only update position
-			local currentRotation = rootPart.CFrame.Rotation
-			local newCFrame = CFrame.new(position) * currentRotation
-			rootPart.CFrame = newCFrame
-			updateLocalTankModelPosition(position)
-		end
-	end
-end
-
-local function payloadChanged(newPayload)
-	if not lastPayload then
-		return true
-	end
-	if (newPayload.Move - lastPayload.Move).Magnitude > 0.05 then
-		return true
-	end
-	if (newPayload.AimDirection - lastPayload.AimDirection).Magnitude > 0.05 then
-		return true
-	end
-	if newPayload.IsFiring ~= lastPayload.IsFiring then
-		return true
-	end
-	local newState = newPayload.State
-	local lastState = lastPayload.State
-	if newState and not lastState then
-		return true
-	elseif newState and lastState then
-		if (newState.Position - lastState.Position).Magnitude > 0.1 then
-			return true
-		end
-		if (newState.Velocity - lastState.Velocity).Magnitude > 0.1 then
-			return true
-		end
-		if math.abs(newState.Facing - lastState.Facing) > 0.05 then
-			return true
-		end
-	end
-	return false
-end
-
-local function sendInput()
 	local payload = {
 		Move = currentMoveDir,
 		AimDirection = currentAimDir,
 		IsFiring = isFiring,
-		State = position and {
+		State = {
 			Position = Vector3.new(position.X, baseHeight or position.Y, position.Z),
 			Velocity = velocity,
 			Facing = facing,
 		},
 	}
 
-	if payloadChanged(payload) then
-		playerInputRemote:FireServer(payload)
-		lastPayload = payload
-	end
+	inputSequence += 1
+	payload.Sequence = inputSequence
+
+	tankClientStateRemote:FireServer(payload)
 end
 
 UserInputService.InputBegan:Connect(function(input, processed)
@@ -994,22 +869,9 @@ tankStateUpdateRemote.OnClientEvent:Connect(function(updates)
 	
 	for _, update in ipairs(updates) do
 		if update.PlayerId == player.UserId then
-			-- This is the local player - store for reconciliation with smoothing
-			local newServerPos = update.Position
-			
-			-- Add to position buffer for smoothing
-			table.insert(serverPositionBuffer, newServerPos)
-			if #serverPositionBuffer > MAX_BUFFER_SIZE then
-				table.remove(serverPositionBuffer, 1)
-			end
-			
-			-- Store latest raw position
-			serverPosition = newServerPos
-			serverVelocity = update.Velocity
-			serverFacing = update.Facing or 0
+			serverPosition = update.Position
 		else
-			-- This is another player - handle interpolation (will implement next)
-			-- TODO: Add other players interpolation
+			-- Other players handled via server replication
 		end
 	end
 end)
@@ -1017,17 +879,29 @@ end)
 RunService.RenderStepped:Connect(function(deltaTime)
 	integrateMovement(deltaTime)
 	
-	-- Reconcile with server if needed
-	reconcileWithServer()
-	
 	sendAccumulator += deltaTime
-	if sendAccumulator >= REMOTE_SEND_INTERVAL then
-		sendAccumulator = 0
-		sendInput()
+	while sendAccumulator >= REMOTE_SEND_INTERVAL do
+		sendAccumulator -= REMOTE_SEND_INTERVAL
+		sendInput(REMOTE_SEND_INTERVAL)
 	end
 
 	if (not currentTank or not currentTank.Parent) or (currentTank and rootPart and not localTankVisual) then
 		updateTankReference()
+	end
+
+	if DEBUG_MOVEMENT and player then
+		debugLastReport += deltaTime
+		if debugLastReport >= DEBUG_REPORT_INTERVAL then
+			debugLastReport -= DEBUG_REPORT_INTERVAL
+			player:SetAttribute("DebugPredictionDiff", debugCurrentPredictionDiff)
+			player:SetAttribute("DebugMaxPredictionDiff", debugMaxPredictionDiff)
+			player:SetAttribute("DebugServerDelta", debugCurrentServerDelta)
+			player:SetAttribute("DebugMaxServerDelta", debugMaxServerDelta)
+			player:SetAttribute("DebugLastCorrectionDiff", debugLastCorrectionDiff)
+			player:SetAttribute("DebugCorrectionCount", debugCorrectionCount)
+			debugMaxPredictionDiff = debugCurrentPredictionDiff
+			debugMaxServerDelta = debugCurrentServerDelta
+		end
 	end
 end)
 

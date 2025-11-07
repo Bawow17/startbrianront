@@ -114,6 +114,9 @@ local function spawnTankRecord(key, options)
 		end
 	end
 
+	local forwardVector = originalModelRotation * Vector3.new(0, 0, -1)
+	local facingOffset = math.atan2(-forwardVector.X, -forwardVector.Z) + math.rad(90)
+	
 	local record = {
 		key = key,
 		player = options.player,
@@ -129,6 +132,8 @@ local function spawnTankRecord(key, options)
 		barrels = barrels,
 		tankType = tankType,
 		originalModelRotation = originalModelRotation, -- Store original rotation from model template
+		lastProcessedSequence = 0,
+		facingOffset = facingOffset,
 	}
 
 	if model and model:IsA("Part") and options.color then
@@ -224,12 +229,11 @@ local function updateTankModelPosition(tank, rootPos)
 	-- Get the model's original rotation from Studio (stored when model was loaded)
 	-- This preserves how the model is oriented in Studio
 	local originalRotation = tank.originalModelRotation or CFrame.new().Rotation
-	-- Extract just the Y rotation from original rotation
-	local _, originalY, _ = originalRotation:ToEulerAnglesXYZ()
+	local facingOffset = tank.facingOffset or 0
 	
-	-- Calculate tank rotation: original model rotation + facing direction
-	-- The facing is relative to world space, so we add it to the original rotation
-	local tankRotation = CFrame.Angles(0, originalY + facing, 0)
+	-- Calculate tank rotation: align player facing while preserving original model rotation
+	local yawRotation = CFrame.Angles(0, facing - facingOffset, 0)
+	local tankRotation = yawRotation * originalRotation
 	
 	-- Rotate the offset by current facing direction to get world-space offset
 	-- The offset is in object space (relative to PrimaryPart's initial rotation), so we need to rotate it
@@ -476,14 +480,14 @@ local function updateFacing(tank)
 	local movement = tank.movement
 	local aim = input.AimDirection
 	if aim.Magnitude > 0.001 then
-		movement.Facing = math.atan2(aim.X, aim.Z)
+		movement.Facing = math.atan2(-aim.X, -aim.Z)
 		return
 	end
 
 	local velocity = movement.Velocity
 	local planarSpeed = Vector3.new(velocity.X, 0, velocity.Z)
 	if planarSpeed.Magnitude > 0.001 then
-		movement.Facing = math.atan2(planarSpeed.X, planarSpeed.Z)
+		movement.Facing = math.atan2(-planarSpeed.X, -planarSpeed.Z)
 	end
 end
 
@@ -525,20 +529,48 @@ local function updateMovement(tank, deltaTime)
 			tank.characterRoot.AssemblyLinearVelocity = movement.Velocity
 		end
 	else
-		-- Server is authoritative for character movement
-		-- Apply Diep.io-style acceleration/drag physics server-side
-		simulateTankPhysics(tank, deltaTime)
-		updateFacing(tank)
-		
-		-- Server simulates physics for validation but does NOT update root or tank model directly
-		-- Client handles all visual updates via client-side prediction for local player
-		-- For other players: They will be updated by their own clients
-		-- Server only simulates physics and sends state updates - no visual updates
-		-- This prevents conflicts between server and client updates
+		-- Player tanks are fully client-driven; no server physics step required
+		if tank.model and tank.partOffsets and tank.playerPositionOffset then
+			updateTankModelPosition(tank, movement.Position)
+		end
+	end
+end
+
+local function applyClientState(tank, state)
+	if not state then
+		return
+	end
+
+	local position = state.Position
+	if typeof(position) == "Vector3" then
+		tank.movement.Position = position
+	end
+
+	local velocity = state.Velocity
+	if typeof(velocity) == "Vector3" then
+		tank.movement.Velocity = Vector3.new(velocity.X, 0, velocity.Z)
+	end
+
+	if typeof(state.Facing) == "number" then
+		tank.movement.Facing = state.Facing
+	end
+
+	tank.lastProcessedSequence = tonumber(state.Sequence) or tank.lastProcessedSequence or 0
+
+	if tank.model and tank.partOffsets and tank.playerPositionOffset then
+		updateTankModelPosition(tank, tank.movement.Position)
 	end
 end
 
 local function applyInputPayload(tank, message)
+	local sequence = tonumber(message.Sequence)
+	if sequence then
+		if sequence <= (tank.lastProcessedSequence or 0) then
+			return
+		end
+		tank.lastProcessedSequence = sequence
+	end
+
 	local move = message.Move
 	if move then
 		move = Vector3.new(move.X or 0, 0, move.Z or 0)
@@ -605,6 +637,15 @@ local function onPlayerAdded(player)
 	bindCharacter(record)
 end
 
+local function onClientState(player, state)
+	local tank = tanksByKey[player]
+	if not tank or tank.isBot then
+		return
+	end
+
+	applyClientState(tank, state)
+end
+
 function TankSystem.applyInput(player, message)
 	local tank = tanksByKey[player]
 	if not tank then
@@ -654,6 +695,7 @@ local function sendStateUpdates()
 				Position = tank.movement.Position,
 				Velocity = tank.movement.Velocity,
 				Facing = tank.movement.Facing or 0,
+				Sequence = tank.lastProcessedSequence or 0,
 			})
 		end
 	end
@@ -682,6 +724,7 @@ function TankSystem.start()
 		end
 		TankSystem.applyInput(player, payload)
 	end)
+	connections[#connections + 1] = InputEvents.TankClientState.OnServerEvent:Connect(onClientState)
 
 	for _, player in ipairs(Players:GetPlayers()) do
 		onPlayerAdded(player)

@@ -23,6 +23,7 @@ local InputEvents = {}
 
 InputEvents.PlayerInput = ensureRemote("PlayerInput", "RemoteEvent")
 InputEvents.TankStateUpdate = ensureRemote("TankStateUpdate", "RemoteEvent")
+InputEvents.TankClientState = ensureRemote("TankClientState", "RemoteEvent")
 
 return InputEvents
 
