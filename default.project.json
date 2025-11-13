@@ -14,15 +14,7 @@
     },
     "ServerStorage": {
       "$className": "ServerStorage",
-      "$ignoreUnknownInstances": true,
-      "Prefabs": {
-        "$className": "Folder",
-        "$ignoreUnknownInstances": true,
-        "Tanks": {
-          "$className": "Folder",
-          "$ignoreUnknownInstances": true
-        }
-      }
+      "$ignoreUnknownInstances": true
     },
     "StarterPlayer": {
       "$className": "StarterPlayer",

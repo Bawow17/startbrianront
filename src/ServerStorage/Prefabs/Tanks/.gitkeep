@@ -1,6 +1,0 @@
--- Place tank model folders here
--- Each folder should contain:
---   - Tank model (Model instance)
---   - PlayerPosition (Part) - marks where player should be positioned
---   - Barrel (Part) - can be duplicated for multi-barrel setups
-
