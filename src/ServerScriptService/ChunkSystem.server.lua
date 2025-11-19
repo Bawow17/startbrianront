@@ -1,11 +1,23 @@
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local ServerStorage = game:GetService("ServerStorage")
+local DataStoreService = game:GetService("DataStoreService")
+local MemoryStoreService = game:GetService("MemoryStoreService")
+local HttpService = game:GetService("HttpService")
 local BiomeConfig = require(script.Parent:WaitForChild("ChunkBiomeConfig"))
+local DailyWorldCycle = require(script.Parent:WaitForChild("DailyWorldCycle"))
 
 local CHUNK_SIZE = 128
 local LOAD_RADIUS = 10
 local UPDATE_INTERVAL = 1
+local REFRESH_CHECK_INTERVAL = 30
+local TELEPORT_OFFSET = Vector3.new(0, 5, 0)
+local CYCLE_SEED_STORE_NAME = "ChunkWorldCycleSeeds"
+local MEMORY_SEED_MAP_NAME = "ChunkWorldCycleSeeds"
+local MEMORY_SEED_TTL_SECONDS = 48 * 60 * 60
+local CYCLE_STATE_KEY = "CurrentState"
+local MAX_SEED_VALUE = 2000000000
+local SCHEDULE_VERSION = DailyWorldCycle.getScheduleVersion()
 
 local WORLD_ORIGIN = Vector3.new(7500, 7500, 7500)
 local MAIN_WORLD_HEIGHT_TOLERANCE = 750
@@ -14,17 +26,23 @@ local PRIME_Z = 19349663
 local BASE_PATCH_SIZE = BiomeConfig.PatchSizeInChunks or 10
 local CENTRAL_BIOME_RADIUS_CHUNKS = math.max(4, math.ceil(BASE_PATCH_SIZE / 3))
 local CENTRAL_BIOME_RADIUS_SQR = CENTRAL_BIOME_RADIUS_CHUNKS * CENTRAL_BIOME_RADIUS_CHUNKS
+local BASE_BIOME_SEED = BiomeConfig.BaseBiomeRandomSeed or BiomeConfig.BiomeRandomSeed
+local BASE_TEMPLATE_SEED = BiomeConfig.BaseTemplateRandomSeed or BiomeConfig.TemplateRandomSeed
+local RNG_BASE_SEED = 987654321
 
 local FOREST_TREE_COUNT_MIN = 3
 local FOREST_TREE_COUNT_MAX = 10
-local FOREST_TREE_MIN_SPACING = 35
+local FOREST_TREE_MIN_SPACING = 42
 local FOREST_TREE_EDGE_MARGIN = 6
 local FOREST_GRASS_COUNT_MIN = 8
 local FOREST_GRASS_COUNT_MAX = 16
-local FOREST_GRASS_MIN_SPACING = 37
+local FOREST_GRASS_MIN_SPACING = 41
 local FOREST_GRASS_EDGE_MARGIN = 4
 
 local TEMPLATE_ROOT_NAME = BiomeConfig.TemplateRootName or "ChunkTemplates"
+local cycleSeedStore = DataStoreService:GetDataStore(CYCLE_SEED_STORE_NAME)
+local memorySeedMap = MemoryStoreService:GetSortedMap(MEMORY_SEED_MAP_NAME)
+local authoritativeCycleState
 
 local function locateTemplatesRoot()
     return ServerStorage:FindFirstChild(TEMPLATE_ROOT_NAME) or Workspace:FindFirstChild(TEMPLATE_ROOT_NAME)
@@ -39,6 +57,205 @@ if not chunksFolder then
     chunksFolder.Parent = Workspace
 end
 
+local spawnLocationCache
+
+local function locateSpawnLocation()
+    if spawnLocationCache and spawnLocationCache.Parent then
+        return spawnLocationCache
+    end
+
+    local spawn = Workspace:FindFirstChild("SpawnLocation")
+    if spawn and spawn:IsA("BasePart") then
+        spawnLocationCache = spawn
+        return spawn
+    end
+
+    for _, descendant in ipairs(Workspace:GetDescendants()) do
+        if descendant:IsA("SpawnLocation") or descendant.Name == "SpawnLocation" then
+            spawnLocationCache = descendant
+            return descendant
+        end
+    end
+
+    return nil
+end
+
+local function getSpawnTeleportCFrame()
+    local spawnPart = locateSpawnLocation()
+    if not spawnPart or not spawnPart.CFrame then
+        return nil
+    end
+    local sizeY = spawnPart.Size and spawnPart.Size.Y or 1
+    return spawnPart.CFrame + Vector3.new(0, sizeY * 0.5, 0) + TELEPORT_OFFSET
+end
+
+local function teleportPlayersToSpawn()
+    local targetCFrame = getSpawnTeleportCFrame()
+    if not targetCFrame then
+        warn("SpawnLocation not found; cannot teleport players after chunk reset.")
+        return
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        local character = player.Character
+        if character then
+            local root = character:FindFirstChild("HumanoidRootPart")
+            if root then
+                root.CFrame = targetCFrame
+            else
+                player:LoadCharacter()
+            end
+        else
+            player:LoadCharacter()
+        end
+    end
+end
+
+local function getUnixMillis()
+    local ok, value = pcall(function()
+        return DateTime.now().UnixTimestampMillis
+    end)
+    if ok then
+        return value
+    end
+    return DateTime.now().UnixTimestamp * 1000
+end
+
+local function computeJobEntropy()
+    local jobId = game.JobId or ""
+    local accumulator = 0
+    for index = 1, #jobId do
+        accumulator = (accumulator + string.byte(jobId, index) * index) % MAX_SEED_VALUE
+    end
+    if accumulator == 0 then
+        accumulator = math.random(1, MAX_SEED_VALUE - 1)
+    end
+    return accumulator
+end
+
+local function generateCycleSeedSet(cycleId)
+    local entropy = getUnixMillis() + computeJobEntropy() + cycleId * 977
+    local rng = Random.new(entropy)
+
+    local function nextSeed()
+        return rng:NextInteger(1, MAX_SEED_VALUE)
+    end
+
+    return {
+        version = 3,
+        signature = HttpService:GenerateGUID(false),
+        rngSeed = nextSeed(),
+        biomeSeed = nextSeed(),
+        templateSeed = nextSeed(),
+        decorationSeed = nextSeed(),
+    }
+end
+
+local function isValidSeedSet(data)
+    return typeof(data) == "table"
+        and typeof(data.rngSeed) == "number"
+        and typeof(data.biomeSeed) == "number"
+        and typeof(data.templateSeed) == "number"
+        and typeof(data.decorationSeed) == "number"
+end
+
+local function isValidCycleState(state)
+    return typeof(state) == "table"
+        and typeof(state.cycleId) == "number"
+        and typeof(state.cycleStartUnix) == "number"
+        and typeof(state.nextRefreshUnix) == "number"
+        and isValidSeedSet(state.seeds)
+end
+
+local function storeCycleStateInMemory(state)
+    if not isValidCycleState(state) then
+        return
+    end
+
+    local success, err = pcall(function()
+        memorySeedMap:SetAsync(CYCLE_STATE_KEY, state, MEMORY_SEED_TTL_SECONDS)
+    end)
+
+    if not success and err then
+        warn(string.format("Failed to store chunk cycle state in memory: %s", err))
+    end
+end
+
+local function readCycleStateFromMemory()
+    local success, data = pcall(function()
+        return memorySeedMap:GetAsync(CYCLE_STATE_KEY)
+    end)
+
+    if success and isValidCycleState(data) then
+        return data
+    elseif not success and data then
+        warn(string.format("Failed to read chunk cycle state from memory: %s", data))
+    end
+
+    return nil
+end
+
+local function buildCycleState(cycleInfo)
+    local seeds = generateCycleSeedSet(cycleInfo.cycleId)
+    return {
+        cycleId = cycleInfo.cycleId,
+        cycleStartUnix = cycleInfo.cycleStartUnix,
+        nextRefreshUnix = cycleInfo.nextRefreshUnix,
+        scheduleVersion = SCHEDULE_VERSION,
+        seeds = seeds,
+        version = seeds.version,
+        signature = seeds.signature,
+    }
+end
+
+local function resolveAuthoritativeCycleState()
+    local candidate = DailyWorldCycle.getCycleInfo()
+
+    if isValidCycleState(authoritativeCycleState)
+        and authoritativeCycleState.scheduleVersion == SCHEDULE_VERSION
+        and (authoritativeCycleState.cycleStartUnix or 0) >= candidate.cycleStartUnix then
+        return authoritativeCycleState
+    end
+
+    local memoryState = readCycleStateFromMemory()
+    if isValidCycleState(memoryState)
+        and memoryState.scheduleVersion == SCHEDULE_VERSION
+        and (memoryState.cycleStartUnix or 0) >= candidate.cycleStartUnix then
+        authoritativeCycleState = memoryState
+        return memoryState
+    end
+
+    local success, result = pcall(function()
+        return cycleSeedStore:UpdateAsync(CYCLE_STATE_KEY, function(current)
+            local currentValid = isValidCycleState(current) and current.scheduleVersion == SCHEDULE_VERSION
+            local currentStart = currentValid and current.cycleStartUnix or -math.huge
+
+            if not currentValid or candidate.cycleStartUnix > currentStart then
+                return buildCycleState(candidate)
+            end
+
+            return current
+        end)
+    end)
+
+    if success and isValidCycleState(result) then
+        authoritativeCycleState = result
+        storeCycleStateInMemory(result)
+        return result
+    elseif not success and result then
+        warn(string.format("Failed to update chunk cycle state: %s", result))
+    end
+
+    if isValidCycleState(memoryState) and memoryState.scheduleVersion == SCHEDULE_VERSION then
+        authoritativeCycleState = memoryState
+        return memoryState
+    end
+
+    local fallback = buildCycleState(candidate)
+    authoritativeCycleState = fallback
+    storeCycleStateInMemory(fallback)
+    return fallback
+end
 local rng = Random.new()
 local templateCache = {}
 local centralBiomeName
@@ -198,13 +415,6 @@ local function selectCentralBiome()
 
     return entries[1] and entries[1].name or "Flatlands"
 end
-
-centralBiomeName = selectCentralBiome()
-Workspace:SetAttribute("CentralBiome", centralBiomeName)
-Workspace:SetAttribute("CentralBiomeRadius", CENTRAL_BIOME_RADIUS_CHUNKS)
-task.defer(updateCentralGroundColors)
-
-chunkHeights[chunkKey(0, 0)] = WORLD_ORIGIN.Y
 
 local function getNeighborHeights(cx, cz)
     local neighbors = {}
@@ -464,7 +674,7 @@ local biomeDecorations = {
             seed = 45678,
             countMin = 4,
             countMax = 8,
-            minSpacing = 32,
+            minSpacing = 40,
             edgeMargin = 8,
             attributeName = "DesertCactusDecoration",
             blockAttributes = { DesertCactusDecoration = true },
@@ -474,7 +684,7 @@ local biomeDecorations = {
             seed = 56789,
             countMin = 2,
             countMax = 4,
-            minSpacing = 50,
+            minSpacing = 55,
             edgeMargin = 8,
             attributeName = "DesertTumbleweedDecoration",
             blockAttributes = { DesertCactusDecoration = true, DesertTumbleweedDecoration = true },
@@ -487,7 +697,7 @@ local biomeDecorations = {
             seed = 67890,
             countMin = 3,
             countMax = 7,
-            minSpacing = 42,
+            minSpacing = 48,
             edgeMargin = 10,
             attributeName = "SwampTreeDecoration",
             blockAttributes = { SwampTreeDecoration = true },
@@ -497,7 +707,7 @@ local biomeDecorations = {
             seed = 78901,
             countMin = 1,
             countMax = 2,
-            minSpacing = 28,
+            minSpacing = 36,
             edgeMargin = 12,
             attributeName = "SwampPondDecoration",
             blockAttributes = { SwampTreeDecoration = true, SwampPondDecoration = true },
@@ -509,13 +719,29 @@ local biomeDecorations = {
             seed = 89012,
             countMin = 3,
             countMax = 6,
-            minSpacing = 39,
+            minSpacing = 43,
             edgeMargin = 10,
             attributeName = "TundraTreeDecoration",
             blockAttributes = { TundraTreeDecoration = true },
         },
     },
 }
+
+local function setDecorationSeedsForCycle(cycleId, seedSet)
+    for _, configs in pairs(biomeDecorations) do
+        for _, config in ipairs(configs) do
+            config._baseSeed = config._baseSeed or config.seed or (config.attributeName and #config.attributeName * 7919) or 1
+
+            local baseSeed = seedSet and seedSet.decorationSeed or DailyWorldCycle.makeSeed(config._baseSeed, cycleId)
+            local mixed = (baseSeed + config._baseSeed * 977 + cycleId * 131071) % MAX_SEED_VALUE
+            if mixed == 0 then
+                mixed = baseSeed
+            end
+
+            config.seed = mixed
+        end
+    end
+end
 
 local function decorateChunk(chunkModel, cx, cz, centerPosition, biomeName)
     local configs = biomeDecorations[biomeName]
@@ -619,6 +845,62 @@ local function unloadChunk(key)
     loadedChunks[key] = nil
 end
 
+local function clearAllChunks()
+    for key in pairs(loadedChunks) do
+        unloadChunk(key)
+    end
+    loadedChunks = {}
+end
+
+local function resetChunkState()
+    chunkHeights = {}
+    chunkHeights[chunkKey(0, 0)] = WORLD_ORIGIN.Y
+    templateCache = {}
+end
+
+local currentCycleId
+local currentStateSignature = ""
+local nextRefreshUnix = 0
+
+local function applyCycleState(cycleState, isInitial)
+    if not isValidCycleState(cycleState) then
+        return
+    end
+
+    currentCycleId = cycleState.cycleId
+    nextRefreshUnix = cycleState.nextRefreshUnix or 0
+
+    Workspace:SetAttribute("ChunkCycleId", currentCycleId)
+    Workspace:SetAttribute("ChunkCycleNextRefreshUnix", nextRefreshUnix)
+    Workspace:SetAttribute("CentralBiomeRadius", CENTRAL_BIOME_RADIUS_CHUNKS)
+    Workspace:SetAttribute("ChunkScheduleVersion", SCHEDULE_VERSION)
+
+    local cycleSeeds = cycleState.seeds or generateCycleSeedSet(currentCycleId)
+    Workspace:SetAttribute("ChunkCycleSeedVersion", cycleSeeds.version or 0)
+    Workspace:SetAttribute("ChunkCycleSeedSignature", cycleSeeds.signature or "")
+
+    rng = Random.new((cycleSeeds and cycleSeeds.rngSeed) or DailyWorldCycle.makeSeed(RNG_BASE_SEED, currentCycleId))
+
+    BiomeConfig.configureSeeds({
+        BiomeRandomSeed = (cycleSeeds and cycleSeeds.biomeSeed) or DailyWorldCycle.makeSeed(BASE_BIOME_SEED, currentCycleId),
+        TemplateRandomSeed = (cycleSeeds and cycleSeeds.templateSeed) or DailyWorldCycle.makeSeed(BASE_TEMPLATE_SEED, currentCycleId),
+    })
+
+    setDecorationSeedsForCycle(currentCycleId, cycleSeeds)
+    resetChunkState()
+
+    centralBiomeName = selectCentralBiome()
+    Workspace:SetAttribute("CentralBiome", centralBiomeName)
+    currentStateSignature = cycleSeeds.signature or ""
+
+    if not isInitial then
+        clearAllChunks()
+    end
+
+    task.defer(updateCentralGroundColors)
+    teleportPlayersToSpawn()
+end
+
 local function updateChunks()
     local needed = {}
 
@@ -658,7 +940,24 @@ local function updateChunks()
     end
 end
 
+applyCycleState(resolveAuthoritativeCycleState(), true)
+
+local cycleCheckElapsed = 0
+
 while true do
     updateChunks()
+    cycleCheckElapsed += UPDATE_INTERVAL
+
+    if cycleCheckElapsed >= REFRESH_CHECK_INTERVAL then
+        cycleCheckElapsed = 0
+        local cycleState = resolveAuthoritativeCycleState()
+        if not currentCycleId
+            or cycleState.cycleId ~= currentCycleId
+            or (cycleState.seeds and cycleState.seeds.signature ~= currentStateSignature)
+            or (cycleState.signature and cycleState.signature ~= currentStateSignature) then
+            applyCycleState(cycleState, false)
+        end
+    end
+
     task.wait(UPDATE_INTERVAL)
 end

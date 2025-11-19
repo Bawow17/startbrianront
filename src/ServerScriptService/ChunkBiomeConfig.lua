@@ -1,8 +1,10 @@
 local ChunkBiomes = {}
 
 ChunkBiomes.TemplateRootName = "ChunkTemplates"
-ChunkBiomes.BiomeRandomSeed = 53298571
-ChunkBiomes.TemplateRandomSeed = 80235813
+ChunkBiomes.BaseBiomeRandomSeed = 53298571
+ChunkBiomes.BaseTemplateRandomSeed = 80235813
+ChunkBiomes.BiomeRandomSeed = ChunkBiomes.BaseBiomeRandomSeed
+ChunkBiomes.TemplateRandomSeed = ChunkBiomes.BaseTemplateRandomSeed
 ChunkBiomes.PatchSizeInChunks = 16
 ChunkBiomes.PatchJitterRatio = 0.15
 ChunkBiomes.PrimeX = 73856093
@@ -73,6 +75,24 @@ local function randomForChunk(seed, cx, cz)
 end
 
 local patchCache = {}
+
+function ChunkBiomes.configureSeeds(seedConfig)
+    seedConfig = seedConfig or {}
+
+    if seedConfig.BiomeRandomSeed then
+        ChunkBiomes.BiomeRandomSeed = seedConfig.BiomeRandomSeed
+    else
+        ChunkBiomes.BiomeRandomSeed = ChunkBiomes.BaseBiomeRandomSeed
+    end
+
+    if seedConfig.TemplateRandomSeed then
+        ChunkBiomes.TemplateRandomSeed = seedConfig.TemplateRandomSeed
+    else
+        ChunkBiomes.TemplateRandomSeed = ChunkBiomes.BaseTemplateRandomSeed
+    end
+
+    patchCache = {}
+end
 
 local function getPatchData(patchX, patchZ)
     local key = patchX .. ":" .. patchZ
