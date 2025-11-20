@@ -9,7 +9,8 @@ local DailyWorldCycle = require(script.Parent:WaitForChild("DailyWorldCycle"))
 
 local CHUNK_SIZE = 128
 local LOAD_RADIUS = 10
-local UPDATE_INTERVAL = 1
+local MAX_CHUNK_SPAWNS_PER_STEP = 7
+local UPDATE_INTERVAL = 0.1
 local REFRESH_CHECK_INTERVAL = 30
 local TELEPORT_OFFSET = Vector3.new(0, 5, 0)
 local CYCLE_SEED_STORE_NAME = "ChunkWorldCycleSeeds"
@@ -534,7 +535,7 @@ local function getTemplatesForPath(path)
     return models
 end
 
-local function scatterModels(chunkModel, centerPosition, config)
+local function scatterModels(chunkModel, centerPosition, config, targetPosition)
     local templates = config.templates
     if not templates then
         if config.templatePath then
@@ -550,6 +551,7 @@ local function scatterModels(chunkModel, centerPosition, config)
 
     local desiredCount = randomSource:NextInteger(config.countMin, config.countMax)
     local placedPositions = {}
+    local placements = {}
     local attempts = 0
     local maxAttempts = desiredCount * 15
     local halfSize = CHUNK_SIZE * 0.5 - (config.edgeMargin or 0)
@@ -603,31 +605,46 @@ local function scatterModels(chunkModel, centerPosition, config)
 
             if not tooClose then
                 local template = templates[randomSource:NextInteger(1, #templates)]
-                local clone = template:Clone()
-                clone:SetAttribute(config.attributeName, true)
-
-                for _, descendant in ipairs(clone:GetDescendants()) do
-                    if descendant:IsA("BasePart") then
-                        descendant.Anchored = true
-                        descendant.CanCollide = config.collidable ~= false
-                    end
-                end
-
-                local basePivot = clone:GetPivot()
                 local rotation = randomSource:NextNumber(0, math.pi * 2)
-                local rotationCF = CFrame.Angles(0, rotation, 0)
+                local distSq = targetPosition and (targetPosition - result.Position).Magnitude ^ 2 or 0
 
-                local xVector = rotationCF:VectorToWorldSpace(basePivot.XVector)
-                local yVector = rotationCF:VectorToWorldSpace(basePivot.YVector)
-                local zVector = rotationCF:VectorToWorldSpace(basePivot.ZVector)
-
-                local finalCFrame = CFrame.fromMatrix(result.Position - Vector3.new(0, 0.1, 0), xVector, yVector, zVector)
-                clone:PivotTo(finalCFrame)
-                clone.Parent = chunkModel
+                table.insert(placements, {
+                    template = template,
+                    position = result.Position,
+                    rotation = rotation,
+                    distSq = distSq,
+                })
 
                 table.insert(placedPositions, position2D)
             end
         end
+    end
+
+    table.sort(placements, function(a, b)
+        return a.distSq < b.distSq
+    end)
+
+    for _, placement in ipairs(placements) do
+        local clone = placement.template:Clone()
+        clone:SetAttribute(config.attributeName, true)
+
+        for _, descendant in ipairs(clone:GetDescendants()) do
+            if descendant:IsA("BasePart") then
+                descendant.Anchored = true
+                descendant.CanCollide = config.collidable ~= false
+            end
+        end
+
+        local basePivot = clone:GetPivot()
+        local rotationCF = CFrame.Angles(0, placement.rotation, 0)
+
+        local xVector = rotationCF:VectorToWorldSpace(basePivot.XVector)
+        local yVector = rotationCF:VectorToWorldSpace(basePivot.YVector)
+        local zVector = rotationCF:VectorToWorldSpace(basePivot.ZVector)
+
+        local finalCFrame = CFrame.fromMatrix(placement.position - Vector3.new(0, 0.1, 0), xVector, yVector, zVector)
+        clone:PivotTo(finalCFrame)
+        clone.Parent = chunkModel
     end
 end
 
@@ -743,7 +760,7 @@ local function setDecorationSeedsForCycle(cycleId, seedSet)
     end
 end
 
-local function decorateChunk(chunkModel, cx, cz, centerPosition, biomeName)
+local function decorateChunk(chunkModel, cx, cz, centerPosition, biomeName, targetPosition)
     local configs = biomeDecorations[biomeName]
     if not configs then
         return
@@ -753,11 +770,11 @@ local function decorateChunk(chunkModel, cx, cz, centerPosition, biomeName)
     chunkModel:SetAttribute("ChunkZ", chunkModel:GetAttribute("ChunkZ") or cz)
 
     for _, config in ipairs(configs) do
-        scatterModels(chunkModel, centerPosition, config)
+        scatterModels(chunkModel, centerPosition, config, targetPosition)
     end
 end
 
-local function spawnChunk(cx, cz)
+local function spawnChunk(cx, cz, sourcePosition)
     templatesRoot = templatesRoot or locateTemplatesRoot()
     if not templatesRoot then
         return
@@ -824,7 +841,7 @@ local function spawnChunk(cx, cz)
     }
 
     if biomeName then
-        decorateChunk(clone, cx, cz, center, biomeName)
+        decorateChunk(clone, cx, cz, center, biomeName, sourcePosition)
     end
 
     if biomeName == centralBiomeName and cx == 1 and cz == 0 then
@@ -902,39 +919,93 @@ local function applyCycleState(cycleState, isInitial)
 end
 
 local function updateChunks()
-    local needed = {}
+    local chunkEntries = {}
+    local chunkMap = {}
+
+    local function enqueueChunk(chunkX, chunkZ, distSq, sourcePosition)
+        local key = chunkKey(chunkX, chunkZ)
+        local existing = chunkMap[key]
+        if existing then
+            if distSq < existing.distSq then
+                existing.distSq = distSq
+                existing.sourcePosition = sourcePosition
+            end
+            return
+        end
+
+        local entry = {
+            key = key,
+            x = chunkX,
+            z = chunkZ,
+            distSq = distSq,
+            sourcePosition = sourcePosition,
+        }
+
+        chunkMap[key] = entry
+        table.insert(chunkEntries, entry)
+    end
+
+    local function processPlayer(player)
+        local character = player.Character
+        if not character then
+            return
+        end
+
+        local rootPart = character:FindFirstChild("HumanoidRootPart")
+        if not rootPart then
+            return
+        end
+
+        local position = rootPart.Position
+        local heightDelta = math.abs(position.Y - WORLD_ORIGIN.Y)
+        if heightDelta > MAIN_WORLD_HEIGHT_TOLERANCE then
+            return
+        end
+
+        local playerChunkX, playerChunkZ = worldToChunk(position)
+        for dx = -LOAD_RADIUS, LOAD_RADIUS do
+            for dz = -LOAD_RADIUS, LOAD_RADIUS do
+                local chunkX = playerChunkX + dx
+                local chunkZ = playerChunkZ + dz
+
+                local chunkWorldX = WORLD_ORIGIN.X + chunkX * CHUNK_SIZE
+                local chunkWorldZ = WORLD_ORIGIN.Z + chunkZ * CHUNK_SIZE
+                local diffX = position.X - chunkWorldX
+                local diffZ = position.Z - chunkWorldZ
+                local distSq = diffX * diffX + diffZ * diffZ
+
+                enqueueChunk(chunkX, chunkZ, distSq, position)
+            end
+        end
+    end
 
     for _, player in ipairs(Players:GetPlayers()) do
-        local character = player.Character
-        if character then
-            local rootPart = character:FindFirstChild("HumanoidRootPart")
-            if rootPart then
-                local position = rootPart.Position
-                local heightDelta = math.abs(position.Y - WORLD_ORIGIN.Y)
+        processPlayer(player)
+    end
 
-                if heightDelta <= MAIN_WORLD_HEIGHT_TOLERANCE then
-                    local cx, cz = worldToChunk(position)
+    table.sort(chunkEntries, function(a, b)
+        return a.distSq < b.distSq
+    end)
 
-                    for dx = -LOAD_RADIUS, LOAD_RADIUS do
-                        for dz = -LOAD_RADIUS, LOAD_RADIUS do
-                            local chunkX = cx + dx
-                            local chunkZ = cz + dz
-                            local key = chunkKey(chunkX, chunkZ)
+    local seen = {}
+    local spawnedThisStep = 0
+    for _, entry in ipairs(chunkEntries) do
+        if not seen[entry.key] then
+            seen[entry.key] = true
 
-                            needed[key] = needed[key] or { x = chunkX, z = chunkZ }
-                        end
-                    end
+            if not loadedChunks[entry.key] then
+                spawnChunk(entry.x, entry.z, entry.sourcePosition)
+                spawnedThisStep += 1
+
+                if spawnedThisStep >= MAX_CHUNK_SPAWNS_PER_STEP then
+                    break
                 end
             end
         end
     end
 
-    for key, info in pairs(needed) do
-        spawnChunk(info.x, info.z)
-    end
-
     for key in pairs(loadedChunks) do
-        if not needed[key] then
+        if not chunkMap[key] then
             unloadChunk(key)
         end
     end
