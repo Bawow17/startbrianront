@@ -2,7 +2,7 @@ local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 
 local INCREMENT = 10
-local DEFAULT_WALKSPEED = 16
+local DEFAULT_WALKSPEED = 24
 
 local player = Players.LocalPlayer
 

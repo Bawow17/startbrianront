@@ -1,5 +1,6 @@
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
 local ServerStorage = game:GetService("ServerStorage")
 local DataStoreService = game:GetService("DataStoreService")
 local MemoryStoreService = game:GetService("MemoryStoreService")
@@ -33,18 +34,73 @@ local RNG_BASE_SEED = 987654321
 
 local FOREST_TREE_COUNT_MIN = 3
 local FOREST_TREE_COUNT_MAX = 10
-local FOREST_TREE_MIN_SPACING = 42
+local FOREST_TREE_MIN_SPACING = 52
 local FOREST_TREE_EDGE_MARGIN = 6
 local FOREST_GRASS_COUNT_MIN = 8
 local FOREST_GRASS_COUNT_MAX = 16
 local FOREST_GRASS_MIN_SPACING = 41
 local FOREST_GRASS_EDGE_MARGIN = 4
 
+local LIGHT_SHARD_TEMPLATE_FOLDER_NAME = "LightShardTemplates"
+local LIGHT_SHARD_MODEL_NAME = "CommonLightShard"
+local LIGHT_SHARD_RARITIES = {
+    {
+        name = "Common",
+        templateName = "CommonLightShard",
+        weight = 0.70,
+    },
+    {
+        name = "Uncommon",
+        templateName = "UncommonLightShard",
+        weight = 0.24,
+    },
+    {
+        name = "Rare",
+        templateName = "RareLightShard",
+        weight = 0.05,
+    },
+    {
+        name = "Epic",
+        templateName = "EpicLightShard",
+        weight = 0.008,
+    },
+    {
+        name = "Legendary",
+        templateName = "LegendaryLightShard",
+        weight = 0.0015,
+    },
+    {
+        name = "Mythical",
+        templateName = "MythicalLightShard",
+        weight = 0.0005,
+    },
+}
+local LIGHT_SHARD_BASE_SEED = RNG_BASE_SEED + 13579
+local LIGHT_SHARD_SPAWN_INTERVAL = 0.5
+local LIGHT_SHARD_MAX_ACTIVE = 10000
+local LIGHT_SHARD_SPAWN_RADIUS_MIN_CHUNKS = 0
+local LIGHT_SHARD_SPAWN_RADIUS_MAX_CHUNKS = 3000
+local LIGHT_SHARD_SPAWNS_PER_INTERVAL = 5
+local LIGHT_SHARD_VISIBILITY_RADIUS_CHUNKS = 10
+local LIGHT_SHARD_FORCE_VISIBILITY = true
+local LIGHT_SHARD_MIN_ALTITUDE = 175
+local LIGHT_SHARD_HORIZONTAL_DURATION = 200
+local LIGHT_SHARD_HORIZONTAL_SPEED = 45
+local LIGHT_SHARD_LAND_HEIGHT_OFFSET = 2
+local LIGHT_SHARD_LAND_DETECTION_TOLERANCE = 0.5
+local LIGHT_SHARD_LIFETIME_AFTER_LAND = 10
+local LIGHT_SHARD_DEBUG = false
+
 local TEMPLATE_ROOT_NAME = BiomeConfig.TemplateRootName or "ChunkTemplates"
 local cycleSeedStore = DataStoreService:GetDataStore(CYCLE_SEED_STORE_NAME)
 local memorySeedMap = MemoryStoreService:GetSortedMap(MEMORY_SEED_MAP_NAME)
 local authoritativeCycleState
-
+local currentCycleStartUnix = 0
+local currentCycleStartMillis = 0.0
+local currentCycleId
+local currentStateSignature = ""
+local nextRefreshUnix = 0
+local chunkHeights = {}
 local function locateTemplatesRoot()
     return ServerStorage:FindFirstChild(TEMPLATE_ROOT_NAME) or Workspace:FindFirstChild(TEMPLATE_ROOT_NAME)
 end
@@ -58,7 +114,87 @@ if not chunksFolder then
     chunksFolder.Parent = Workspace
 end
 
+local lightShardFolder = Workspace:FindFirstChild("LightShards")
+if not lightShardFolder then
+    lightShardFolder = Instance.new("Folder")
+    lightShardFolder.Name = "LightShards"
+    lightShardFolder.Parent = Workspace
+end
+
 local spawnLocationCache
+local raycastGround
+
+local function clearArray(list)
+    for index = #list, 1, -1 do
+        list[index] = nil
+    end
+end
+
+local function clearDictionary(map)
+    for key in pairs(map) do
+        map[key] = nil
+    end
+end
+
+local function shardDebugPrint(...)
+    if LIGHT_SHARD_DEBUG then
+        warn("[LightShard]", ...)
+    end
+end
+
+local function formatVector3(vec)
+    return string.format("(%.1f, %.1f, %.1f)", vec.X, vec.Y, vec.Z)
+end
+
+local function horizontalDescentEase(t, finalSlope)
+    finalSlope = finalSlope or 0
+    local clampedT = math.clamp(t or 0, 0, 1)
+    local coeff = math.clamp(finalSlope, 0, 1)
+    local value = (-1 + coeff) * clampedT * clampedT * clampedT + (1 - coeff) * clampedT * clampedT + clampedT
+    return math.clamp(value, 0, 1)
+end
+
+local function getLightShardSpawnStep()
+    local perInterval = math.max(1, math.floor(LIGHT_SHARD_SPAWNS_PER_INTERVAL + 0.5))
+    local step = LIGHT_SHARD_SPAWN_INTERVAL / perInterval
+    if step <= 0 then
+        step = 0.05
+    end
+    return perInterval, step
+end
+
+local function selectLightShardRarity(randomSource)
+    if not LIGHT_SHARD_RARITIES or #LIGHT_SHARD_RARITIES == 0 then
+        return {
+            name = "Default",
+            templateName = LIGHT_SHARD_MODEL_NAME,
+            weight = 1,
+        }
+    end
+
+    local roll = randomSource and randomSource:NextNumber() or math.random()
+    local cumulative = 0
+    local last = LIGHT_SHARD_RARITIES[#LIGHT_SHARD_RARITIES]
+    for _, rarity in ipairs(LIGHT_SHARD_RARITIES) do
+        cumulative += rarity.weight or 0
+        if roll <= cumulative then
+            return rarity
+        end
+        last = rarity
+    end
+    return last
+end
+
+local function estimateDescentDuration()
+    local descentSpeed = math.max(LIGHT_SHARD_HORIZONTAL_SPEED, 0.1)
+    return (LIGHT_SHARD_MIN_ALTITUDE + 100) / descentSpeed
+end
+
+local function getLightShardLifetimeWindow()
+    local totalAirTime = math.max(0, LIGHT_SHARD_HORIZONTAL_DURATION + estimateDescentDuration())
+    local buffer = math.max(LIGHT_SHARD_SPAWN_INTERVAL * 2, 1)
+    return totalAirTime + LIGHT_SHARD_LIFETIME_AFTER_LAND + buffer
+end
 
 local function locateSpawnLocation()
     if spawnLocationCache and spawnLocationCache.Parent then
@@ -393,8 +529,35 @@ local function chunkCenterWorldPosition(cx, cz, height)
     )
 end
 
+local function getCycleElapsedSeconds()
+    if currentCycleStartMillis and currentCycleStartMillis > 0 then
+        local ok, nowMillis = pcall(function()
+            return DateTime.now().UnixTimestampMillis
+        end)
+        if ok then
+            return math.max(0, (nowMillis - currentCycleStartMillis) / 1000)
+        end
+    end
+
+    if currentCycleStartUnix and currentCycleStartUnix > 0 then
+        local ok, nowSeconds = pcall(function()
+            return DateTime.now().UnixTimestamp
+        end)
+        if ok then
+            return math.max(0, nowSeconds - currentCycleStartUnix)
+        end
+    end
+
+    return 0
+end
+
 local loadedChunks = {}
-local chunkHeights = {}
+local playerChunkPositions = {}
+local lightShardSchedule = {}
+local activeLightShards = {}
+local lightShardLastScheduledOrdinal = -1
+local lightShardCenterChunkX = 0
+local lightShardCenterChunkZ = 0
 
 local function selectCentralBiome()
     local entries = {}
@@ -678,7 +841,7 @@ local biomeDecorations = {
             seed = 34567,
             countMin = 10,
             countMax = 24,
-            minSpacing = 37,
+            minSpacing = 43,
             edgeMargin = 6,
             attributeName = "FlatlandsGrassDecoration",
             blockAttributes = { FlatlandsGrassDecoration = true },
@@ -691,7 +854,7 @@ local biomeDecorations = {
             seed = 45678,
             countMin = 4,
             countMax = 8,
-            minSpacing = 40,
+            minSpacing = 50,
             edgeMargin = 8,
             attributeName = "DesertCactusDecoration",
             blockAttributes = { DesertCactusDecoration = true },
@@ -701,7 +864,7 @@ local biomeDecorations = {
             seed = 56789,
             countMin = 2,
             countMax = 4,
-            minSpacing = 55,
+            minSpacing = 57,
             edgeMargin = 8,
             attributeName = "DesertTumbleweedDecoration",
             blockAttributes = { DesertCactusDecoration = true, DesertTumbleweedDecoration = true },
@@ -714,7 +877,7 @@ local biomeDecorations = {
             seed = 67890,
             countMin = 3,
             countMax = 7,
-            minSpacing = 48,
+            minSpacing = 68,
             edgeMargin = 10,
             attributeName = "SwampTreeDecoration",
             blockAttributes = { SwampTreeDecoration = true },
@@ -736,13 +899,100 @@ local biomeDecorations = {
             seed = 89012,
             countMin = 3,
             countMax = 6,
-            minSpacing = 43,
+            minSpacing = 53,
             edgeMargin = 10,
             attributeName = "TundraTreeDecoration",
             blockAttributes = { TundraTreeDecoration = true },
         },
     },
 }
+
+local decorationAttributeMap = {}
+for _, configs in pairs(biomeDecorations) do
+    for _, config in ipairs(configs) do
+        if config.attributeName then
+            decorationAttributeMap[config.attributeName] = true
+        end
+    end
+end
+
+local function isDecorationInstance(instance)
+    if not instance then
+        return false
+    end
+    local current = instance
+    while current and current ~= Workspace do
+        for attributeName in pairs(decorationAttributeMap) do
+            if current:GetAttribute(attributeName) then
+                return true
+            end
+        end
+        current = current.Parent
+    end
+    return false
+end
+
+local function _raycastGround(position, additionalIgnore)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.IgnoreWater = false
+
+    local ignore = {}
+    if lightShardFolder then
+        table.insert(ignore, lightShardFolder)
+    end
+    if additionalIgnore then
+        if typeof(additionalIgnore) == "Instance" then
+            table.insert(ignore, additionalIgnore)
+        elseif typeof(additionalIgnore) == "table" then
+            for _, inst in ipairs(additionalIgnore) do
+                table.insert(ignore, inst)
+            end
+        end
+    end
+
+    local origin = Vector3.new(position.X, position.Y + 2000, position.Z)
+    local direction = Vector3.new(0, -4000, 0)
+
+    for _ = 1, 16 do
+        params.FilterDescendantsInstances = ignore
+        local result = Workspace:Raycast(origin, direction, params)
+        if not result then
+            break
+        end
+
+        if isDecorationInstance(result.Instance) then
+            table.insert(ignore, result.Instance)
+        else
+            return result.Position
+        end
+    end
+
+    return nil
+end
+raycastGround = _raycastGround
+
+local function resolveShardLandingPosition(shard)
+    if shard.landingPosition and shard.landingPositionAccurate then
+        return shard.landingPosition
+    end
+
+    local basePosition = shard.spawnPosition or WORLD_ORIGIN
+    local travelDuration = LIGHT_SHARD_HORIZONTAL_DURATION + estimateDescentDuration()
+    local travel = shard.horizontalDirection * shard.horizontalSpeed * travelDuration
+    local referencePosition = basePosition + travel
+
+    local hit = raycastGround(referencePosition)
+    if hit then
+        shard.landingPosition = hit
+        shard.landingPositionAccurate = true
+        return shard.landingPosition
+    end
+
+    shard.landingPosition = Vector3.new(referencePosition.X, WORLD_ORIGIN.Y, referencePosition.Z)
+    shard.landingPositionAccurate = false
+    return shard.landingPosition
+end
 
 local function setDecorationSeedsForCycle(cycleId, seedSet)
     for _, configs in pairs(biomeDecorations) do
@@ -756,6 +1006,522 @@ local function setDecorationSeedsForCycle(cycleId, seedSet)
             end
 
             config.seed = mixed
+        end
+    end
+end
+
+local lightShardTemplates = {}
+local lightShardTemplateMissingWarned = {}
+
+local function getLightShardTemplate(templateName)
+    templateName = templateName or LIGHT_SHARD_MODEL_NAME
+
+    local cached = lightShardTemplates[templateName]
+    if cached and cached.Parent then
+        return cached
+    end
+    lightShardTemplates[templateName] = nil
+
+    local container = ServerStorage:FindFirstChild(LIGHT_SHARD_TEMPLATE_FOLDER_NAME) or ServerStorage
+    if not container then
+        if not lightShardTemplateMissingWarned[templateName] then
+            warn(string.format("Light shard template folder '%s' not found in ServerStorage.", LIGHT_SHARD_TEMPLATE_FOLDER_NAME))
+            lightShardTemplateMissingWarned[templateName] = true
+        end
+        return nil
+    end
+
+    local template = container:FindFirstChild(templateName)
+    if not template or not template:IsA("Model") then
+        if not lightShardTemplateMissingWarned[templateName] then
+            warn(string.format("Light shard model '%s' not found under %s.", templateName, container:GetFullName()))
+            lightShardTemplateMissingWarned[templateName] = true
+        end
+        return nil
+    end
+
+    lightShardTemplates[templateName] = template
+    lightShardTemplateMissingWarned[templateName] = nil
+    return template
+end
+
+local function resetLightShardState()
+    clearDictionary(lightShardSchedule)
+    for id, instance in pairs(activeLightShards) do
+        if instance.model then
+            instance.model:Destroy()
+        end
+        activeLightShards[id] = nil
+    end
+    lightShardLastScheduledOrdinal = -1
+
+    if lightShardFolder then
+        lightShardFolder:ClearAllChildren()
+    end
+end
+
+local function initializeLightShardScheduler()
+    local _, spawnStep = getLightShardSpawnStep()
+    if spawnStep <= 0 then
+        lightShardLastScheduledOrdinal = -1
+        return
+    end
+
+    local elapsed = getCycleElapsedSeconds()
+    local lookback = getLightShardLifetimeWindow()
+    local startTime = math.max(0, elapsed - lookback)
+    local startOrdinal = math.floor(startTime / spawnStep) - 1
+    if startOrdinal < -1 then
+        startOrdinal = -1
+    end
+
+    lightShardLastScheduledOrdinal = startOrdinal
+    shardDebugPrint(string.format(
+        "Shard scheduler initialized at ordinal %d (elapsed %.1fs, lookback %.1fs)",
+        lightShardLastScheduledOrdinal,
+        elapsed,
+        lookback
+    ))
+end
+
+local function makeLightShardRandom(shardOrdinal)
+    local cycleId = currentCycleId or 0
+    local baseSeed = LIGHT_SHARD_BASE_SEED + shardOrdinal * 8191 + cycleId * 131 + shardOrdinal * cycleId
+    local seed = DailyWorldCycle.makeSeed(baseSeed, cycleId)
+    return Random.new(seed)
+end
+
+local function buildLightShardEntry(shardOrdinal, spawnStep)
+    if shardOrdinal < 0 then
+        return nil
+    end
+
+    local randomSource = makeLightShardRandom(shardOrdinal)
+    if not randomSource then
+        return nil
+    end
+
+    local rarity = selectLightShardRarity(randomSource)
+    local templateName = rarity and rarity.templateName or LIGHT_SHARD_MODEL_NAME
+
+    local _, effectiveSpawnStep = getLightShardSpawnStep()
+    if spawnStep and spawnStep > 0 then
+        effectiveSpawnStep = spawnStep
+    end
+
+    local minRadius = math.min(LIGHT_SHARD_SPAWN_RADIUS_MIN_CHUNKS, LIGHT_SHARD_SPAWN_RADIUS_MAX_CHUNKS)
+    local maxRadius = math.max(LIGHT_SHARD_SPAWN_RADIUS_MIN_CHUNKS, LIGHT_SHARD_SPAWN_RADIUS_MAX_CHUNKS)
+    local spawnRadius = randomSource:NextNumber(minRadius, maxRadius)
+    local spawnAngle = randomSource:NextNumber(0, math.pi * 2)
+    local offsetX = math.cos(spawnAngle) * spawnRadius
+    local offsetZ = math.sin(spawnAngle) * spawnRadius
+
+    local withinChunkX = randomSource:NextNumber(-CHUNK_SIZE * 0.5, CHUNK_SIZE * 0.5)
+    local withinChunkZ = randomSource:NextNumber(-CHUNK_SIZE * 0.5, CHUNK_SIZE * 0.5)
+    local spawnHeightOffset = randomSource:NextNumber(-20, 60)
+    local spawnCenterWorldX = WORLD_ORIGIN.X + lightShardCenterChunkX * CHUNK_SIZE
+    local spawnCenterWorldZ = WORLD_ORIGIN.Z + lightShardCenterChunkZ * CHUNK_SIZE
+    local spawnPosition = Vector3.new(
+        spawnCenterWorldX + offsetX * CHUNK_SIZE + withinChunkX,
+        WORLD_ORIGIN.Y + LIGHT_SHARD_MIN_ALTITUDE + spawnHeightOffset,
+        spawnCenterWorldZ + offsetZ * CHUNK_SIZE + withinChunkZ
+    )
+
+    local horizontalAngle = randomSource:NextNumber(0, math.pi * 2)
+    local horizontalDirection = Vector3.new(math.cos(horizontalAngle), 0, math.sin(horizontalAngle))
+    if horizontalDirection.Magnitude < 1e-4 then
+        horizontalDirection = Vector3.new(1, 0, 0)
+    else
+        horizontalDirection = horizontalDirection.Unit
+    end
+
+    local speedMin = LIGHT_SHARD_HORIZONTAL_SPEED * 0.85
+    local speedMax = LIGHT_SHARD_HORIZONTAL_SPEED * 1.15
+    local horizontalSpeed = randomSource:NextNumber(speedMin, speedMax)
+    local expectedLandingPosition = spawnPosition + horizontalDirection * horizontalSpeed * LIGHT_SHARD_HORIZONTAL_DURATION
+
+    local spawnOffset = shardOrdinal * effectiveSpawnStep
+
+    local entry = {
+        id = shardOrdinal,
+        spawnOffset = spawnOffset,
+        spawnPosition = spawnPosition,
+        horizontalDirection = horizontalDirection,
+        horizontalSpeed = horizontalSpeed,
+        descentSpeed = math.abs(horizontalSpeed),
+        expectedLandingPosition = expectedLandingPosition,
+        rarity = rarity and rarity.name or "Default",
+        templateName = templateName,
+    }
+    return entry
+end
+
+local function computeShardLandingPosition(shard)
+    if shard.landingPosition and shard.landingPositionAccurate then
+        return shard.landingPosition
+    end
+
+    local groundHeight = getChunkGroundHeightAt(shard.expectedLandingPosition)
+    shard.landingPosition = Vector3.new(shard.expectedLandingPosition.X, groundHeight, shard.expectedLandingPosition.Z)
+    shard.landingPositionAccurate = true
+    return shard.landingPosition
+end
+
+local function evaluateLightShard(shard, elapsed)
+    if elapsed < 0 then
+        return nil
+    end
+
+if elapsed < LIGHT_SHARD_HORIZONTAL_DURATION then
+    local displacement = shard.horizontalDirection * shard.horizontalSpeed * elapsed
+    local position = shard.spawnPosition + displacement
+    return {
+        state = "horizontal",
+        position = position,
+            direction = shard.horizontalDirection,
+        }
+    end
+
+    local landingPosition = resolveShardLandingPosition(shard)
+    local descentSpeed = math.max(shard.descentSpeed or shard.horizontalSpeed, 0.1)
+    local initialHeight = shard.spawnPosition.Y
+    local dropDistance = math.max(math.abs(initialHeight - landingPosition.Y), 4)
+    local descentDuration = dropDistance / descentSpeed
+    local totalLifetime = LIGHT_SHARD_HORIZONTAL_DURATION + descentDuration + LIGHT_SHARD_LIFETIME_AFTER_LAND
+    if elapsed > totalLifetime then
+        return nil
+    end
+
+    local descentElapsed = math.max(0, elapsed - LIGHT_SHARD_HORIZONTAL_DURATION)
+    local descentT = math.clamp(descentElapsed / math.max(descentDuration, 0.001), 0, 1)
+    local horizontalEase = horizontalDescentEase(descentT, 0.65)
+    local verticalEase = descentT * descentT
+
+    local startHorizontal = shard.spawnPosition + shard.horizontalDirection * shard.horizontalSpeed * LIGHT_SHARD_HORIZONTAL_DURATION
+    local horizontalTarget = Vector3.new(landingPosition.X, startHorizontal.Y, landingPosition.Z)
+    local horizontalPosition = startHorizontal:Lerp(horizontalTarget, horizontalEase)
+    local currentHeight = initialHeight - (initialHeight - landingPosition.Y) * verticalEase
+    local position = Vector3.new(horizontalPosition.X, currentHeight, horizontalPosition.Z)
+
+    if position.Y <= landingPosition.Y + LIGHT_SHARD_LAND_DETECTION_TOLERANCE then
+        return {
+            state = "landed",
+            position = Vector3.new(landingPosition.X, landingPosition.Y + LIGHT_SHARD_LAND_HEIGHT_OFFSET, landingPosition.Z),
+            direction = Vector3.new(0, -1, 0),
+        }
+    end
+
+    local aheadElapsed = math.min(descentElapsed + math.max(0.05 * descentDuration, 0.01), descentDuration)
+    local aheadT = math.clamp(aheadElapsed / math.max(descentDuration, 0.001), 0, 1)
+    local aheadHorizontalEase = horizontalDescentEase(aheadT, 0.65)
+    local aheadVerticalEase = aheadT * aheadT
+    local aheadHorizontal = startHorizontal:Lerp(horizontalTarget, aheadHorizontalEase)
+    local aheadHeight = initialHeight - (initialHeight - landingPosition.Y) * aheadVerticalEase
+    local aheadPos = Vector3.new(aheadHorizontal.X, aheadHeight, aheadHorizontal.Z)
+    local direction = aheadPos - position
+    if direction.Magnitude < 1e-4 then
+        direction = Vector3.new(0, -1, 0)
+    else
+        direction = direction.Unit
+    end
+    return {
+        state = "descent",
+        position = position,
+        direction = direction,
+    }
+end
+
+local function shouldShardBeVisible(position)
+    if LIGHT_SHARD_FORCE_VISIBILITY then
+        return true
+    end
+
+    if LIGHT_SHARD_VISIBILITY_RADIUS_CHUNKS <= 0 then
+        return true
+    end
+
+    if #playerChunkPositions == 0 then
+        return false
+    end
+
+    local shardChunkX, shardChunkZ = worldToChunk(position)
+    local radius = LIGHT_SHARD_VISIBILITY_RADIUS_CHUNKS
+    local radiusSq = radius * radius
+    for _, chunk in ipairs(playerChunkPositions) do
+        local dx = shardChunkX - chunk.x
+        local dz = shardChunkZ - chunk.z
+        if dx * dx + dz * dz <= radiusSq then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function setInFlightVFXEnabled(instance, enabled)
+    if not instance or not instance.model then
+        return
+    end
+
+    if not instance.inFlightVFX then
+        local holder = instance.model:FindFirstChild("InFlight", true)
+        if holder then
+            instance.inFlightVFX = {}
+            for _, descendant in ipairs(holder:GetDescendants()) do
+                if descendant:IsA("ParticleEmitter")
+                    or descendant:IsA("Beam")
+                    or descendant:IsA("Trail")
+                    or descendant:IsA("PointLight")
+                    or descendant:IsA("SpotLight")
+                    or descendant:IsA("SurfaceLight") then
+                    table.insert(instance.inFlightVFX, descendant)
+                end
+            end
+        end
+    end
+
+    if not instance.inFlightVFX then
+        return
+    end
+
+    for _, vfx in ipairs(instance.inFlightVFX) do
+        if vfx:IsA("ParticleEmitter") or vfx:IsA("Beam") or vfx:IsA("Trail") then
+            vfx.Enabled = enabled
+        elseif vfx:IsA("PointLight") or vfx:IsA("SpotLight") or vfx:IsA("SurfaceLight") then
+            vfx.Enabled = enabled
+        end
+    end
+end
+
+local function spawnLightShardInstance(shard)
+    local template = getLightShardTemplate(shard and shard.templateName)
+    if not template then
+        return nil
+    end
+
+    local clone = template:Clone()
+    local primary = clone.PrimaryPart
+    local core = clone:FindFirstChild("Core", true)
+    if core and core:IsA("BasePart") then
+        clone.PrimaryPart = core
+        primary = core
+    end
+    if not primary then
+        for _, descendant in ipairs(clone:GetDescendants()) do
+            if descendant:IsA("BasePart") then
+                clone.PrimaryPart = descendant
+                primary = descendant
+                break
+            end
+        end
+    end
+
+    if not primary then
+        shardDebugPrint("Unable to spawn light shard; template missing BasePart.")
+        clone:Destroy()
+        return nil
+    end
+
+    for _, descendant in ipairs(clone:GetDescendants()) do
+        if descendant:IsA("BasePart") then
+            descendant.Anchored = true
+            descendant.CanCollide = false
+            descendant.CanTouch = false
+            descendant.CanQuery = true
+        end
+    end
+
+    clone:SetAttribute("LightShardId", shard.id)
+    clone.Name = string.format("LightShard_%d", shard.id)
+    clone.Parent = lightShardFolder
+
+    local instanceData = {
+        model = clone,
+    }
+    setInFlightVFXEnabled(instanceData, true)
+    return instanceData
+end
+
+local function destroyLightShardInstance(identifier)
+    local instance = activeLightShards[identifier]
+    if not instance then
+        return false
+    end
+
+    if instance.model then
+        instance.model:Destroy()
+    end
+
+    activeLightShards[identifier] = nil
+    return true
+end
+
+local function updateLightShardInstanceTransform(shard, instance, evaluation)
+    if not instance or not instance.model then
+        return
+    end
+
+    if evaluation.state == "landed" then
+        setInFlightVFXEnabled(instance, false)
+        local landingPosition = resolveShardLandingPosition(shard)
+        local pivotCFrame = CFrame.new(landingPosition + Vector3.new(0, LIGHT_SHARD_LAND_HEIGHT_OFFSET, 0))
+        if not instance.landed or not shard.landingPositionAccurate then
+            instance.model:PivotTo(pivotCFrame)
+        end
+        instance.lastPitch = 0
+        instance.landed = shard.landingPositionAccurate
+        return
+    end
+
+    setInFlightVFXEnabled(instance, true)
+    local direction = evaluation.direction
+    local planarDirection = Vector3.new(direction.X, 0, direction.Z)
+    if planarDirection.Magnitude < 1e-4 then
+        planarDirection = Vector3.new(0, 0, -1)
+    else
+        planarDirection = planarDirection.Unit
+    end
+    local forward = direction.Unit
+    local baseCFrame = CFrame.lookAt(
+        evaluation.position,
+        evaluation.position + forward
+    )
+    local pivotCFrame = baseCFrame * CFrame.Angles(math.rad(90), 0, 0)
+    instance.model:PivotTo(pivotCFrame)
+    local _, pitch, _ = pivotCFrame:ToOrientation()
+    instance.lastPitch = pitch
+end
+
+local function syncLightShardSchedule(elapsed)
+    if LIGHT_SHARD_SPAWN_INTERVAL <= 0 then
+        return
+    end
+
+    local _, spawnStep = getLightShardSpawnStep()
+    if spawnStep <= 0 then
+        return
+    end
+
+    local targetOrdinal = math.floor(math.max(0, elapsed) / spawnStep)
+    local lookback = getLightShardLifetimeWindow()
+    local minOrdinal = math.max(0, targetOrdinal - math.ceil(lookback / spawnStep) - 2)
+    if lightShardLastScheduledOrdinal < minOrdinal - 1 then
+        lightShardLastScheduledOrdinal = minOrdinal - 1
+    end
+
+    if targetOrdinal <= lightShardLastScheduledOrdinal then
+        return
+    end
+
+    for ordinal = lightShardLastScheduledOrdinal + 1, targetOrdinal do
+        local entry = buildLightShardEntry(ordinal, spawnStep)
+        if entry then
+            lightShardSchedule[ordinal] = entry
+        end
+    end
+
+    lightShardLastScheduledOrdinal = targetOrdinal
+end
+
+local function countActiveMovingShards()
+    local count = 0
+    for _, instance in pairs(activeLightShards) do
+        if instance.state ~= "landed" then
+            count += 1
+        end
+    end
+    return count
+end
+
+local function updateLightShards(dt)
+    if not currentCycleId or LIGHT_SHARD_SPAWN_INTERVAL <= 0 then
+        shardDebugPrint(string.format(
+            "Skipping light shard update; cycleId=%s interval=%.2f",
+            tostring(currentCycleId),
+            LIGHT_SHARD_SPAWN_INTERVAL
+        ))
+        return
+    end
+
+    local elapsed = getCycleElapsedSeconds()
+    syncLightShardSchedule(elapsed)
+
+    local totalAirTime = LIGHT_SHARD_HORIZONTAL_DURATION + estimateDescentDuration()
+    local totalLifetime = totalAirTime + LIGHT_SHARD_LIFETIME_AFTER_LAND
+    local activeMovingCount = countActiveMovingShards()
+
+    for id, shard in pairs(lightShardSchedule) do
+        local shardElapsed = elapsed - shard.spawnOffset
+        if shardElapsed > totalLifetime then
+            local instance = activeLightShards[id]
+            if destroyLightShardInstance(id) then
+                if instance and instance.state ~= "landed" then
+                    activeMovingCount = math.max(0, activeMovingCount - 1)
+                end
+            end
+            lightShardSchedule[id] = nil
+            shardDebugPrint(string.format("Shard %d expired after %.2fs", id, shardElapsed))
+        elseif shardElapsed >= 0 then
+            local evaluation = evaluateLightShard(shard, shardElapsed)
+            if evaluation then
+                local visible = shouldShardBeVisible(evaluation.position)
+                local instance = activeLightShards[id]
+
+                if visible then
+                    local movingState = evaluation.state ~= "landed"
+                    local hasCapacity = (not movingState) or activeMovingCount < LIGHT_SHARD_MAX_ACTIVE
+
+                    if not instance and hasCapacity then
+                        instance = spawnLightShardInstance(shard)
+                        if instance then
+                            activeLightShards[id] = instance
+                            instance.state = evaluation.state
+                            if movingState then
+                                activeMovingCount += 1
+                            end
+                            if evaluation.state ~= "landed" then
+                                shardDebugPrint(string.format(
+                                    "Shard %d instantiated in state '%s' at %s",
+                                    id,
+                                    evaluation.state,
+                                    formatVector3(evaluation.position)
+                                ))
+                            end
+                        end
+                    end
+                    if instance then
+                        local previousState = instance.state or evaluation.state
+                        updateLightShardInstanceTransform(shard, instance, evaluation)
+                        if previousState ~= evaluation.state then
+                            if previousState ~= "landed" and evaluation.state == "landed" then
+                                activeMovingCount = math.max(0, activeMovingCount - 1)
+                            elseif previousState == "landed" and evaluation.state ~= "landed" then
+                                activeMovingCount += 1
+                            end
+                            if evaluation.state ~= "landed" then
+                                shardDebugPrint(string.format(
+                                    "Shard %d transitioned to '%s' at %s",
+                                    id,
+                                    evaluation.state,
+                                    formatVector3(evaluation.position)
+                                ))
+                            end
+                            instance.state = evaluation.state
+                        end
+                    end
+                else
+                    if destroyLightShardInstance(id) then
+                        if instance and instance.state ~= "landed" then
+                            activeMovingCount = math.max(0, activeMovingCount - 1)
+                        end
+                        shardDebugPrint(string.format(
+                            "Shard %d hidden (players tracked: %d)",
+                            id,
+                            #playerChunkPositions
+                        ))
+                    end
+                end
+            end
         end
     end
 end
@@ -875,22 +1641,21 @@ local function resetChunkState()
     templateCache = {}
 end
 
-local currentCycleId
-local currentStateSignature = ""
-local nextRefreshUnix = 0
-
 local function applyCycleState(cycleState, isInitial)
     if not isValidCycleState(cycleState) then
         return
     end
 
     currentCycleId = cycleState.cycleId
+    currentCycleStartUnix = cycleState.cycleStartUnix or 0
+    currentCycleStartMillis = (cycleState.cycleStartUnix or 0) * 1000
     nextRefreshUnix = cycleState.nextRefreshUnix or 0
 
     Workspace:SetAttribute("ChunkCycleId", currentCycleId)
     Workspace:SetAttribute("ChunkCycleNextRefreshUnix", nextRefreshUnix)
     Workspace:SetAttribute("CentralBiomeRadius", CENTRAL_BIOME_RADIUS_CHUNKS)
     Workspace:SetAttribute("ChunkScheduleVersion", SCHEDULE_VERSION)
+    Workspace:SetAttribute("LightShardCycleStart", currentCycleStartUnix)
 
     local cycleSeeds = cycleState.seeds or generateCycleSeedSet(currentCycleId)
     Workspace:SetAttribute("ChunkCycleSeedVersion", cycleSeeds.version or 0)
@@ -904,6 +1669,8 @@ local function applyCycleState(cycleState, isInitial)
     })
 
     setDecorationSeedsForCycle(currentCycleId, cycleSeeds)
+    resetLightShardState()
+    initializeLightShardScheduler()
     resetChunkState()
 
     centralBiomeName = selectCentralBiome()
@@ -921,6 +1688,8 @@ end
 local function updateChunks()
     local chunkEntries = {}
     local chunkMap = {}
+
+    clearArray(playerChunkPositions)
 
     local function enqueueChunk(chunkX, chunkZ, distSq, sourcePosition)
         local key = chunkKey(chunkX, chunkZ)
@@ -963,6 +1732,10 @@ local function updateChunks()
         end
 
         local playerChunkX, playerChunkZ = worldToChunk(position)
+        table.insert(playerChunkPositions, {
+            x = playerChunkX,
+            z = playerChunkZ,
+        })
         for dx = -LOAD_RADIUS, LOAD_RADIUS do
             for dz = -LOAD_RADIUS, LOAD_RADIUS do
                 local chunkX = playerChunkX + dx
@@ -1012,6 +1785,11 @@ local function updateChunks()
 end
 
 applyCycleState(resolveAuthoritativeCycleState(), true)
+shardDebugPrint(string.format("Initial cycle applied; cycleId=%s", tostring(currentCycleId)))
+
+RunService.Heartbeat:Connect(function(dt)
+    updateLightShards(dt or 0)
+end)
 
 local cycleCheckElapsed = 0
 
