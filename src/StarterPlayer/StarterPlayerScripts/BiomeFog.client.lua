@@ -38,13 +38,13 @@ local biomeFogSettings = {
     },
     Swamp = {
         color = Color3.fromRGB(12, 31, 10),
-        fogEnd = 900,
-        fogStart = 120,
+        fogEnd = 990,
+        fogStart = 140,
     },
     Tundra = {
         color = Color3.fromRGB(255, 255, 255),
-        fogEnd = 800,
-        fogStart = 75,
+        fogEnd = 830,
+        fogStart = 95,
     },
 }
 
@@ -93,8 +93,19 @@ end
 applyFogSettings(nil)
 
 local function findChunkBiome(cx, cz)
-    local chunkFolder = workspace:FindFirstChild("GeneratedChunks")
-    local chunkModel = chunkFolder and chunkFolder:FindFirstChild("Chunk_" .. cx .. "_" .. cz)
+    local function locateClientChunkFolder()
+        local clientWorld = workspace:FindFirstChild("ClientWorld")
+        if clientWorld then
+            local clientChunks = clientWorld:FindFirstChild("ClientChunks")
+            if clientChunks then
+                return clientChunks
+            end
+        end
+        return workspace:FindFirstChild("GeneratedChunks")
+    end
+
+    local chunkFolder = locateClientChunkFolder()
+    local chunkModel = chunkFolder and chunkFolder:FindFirstChild(string.format("Chunk_%d_%d", cx, cz))
     if chunkModel then
         return chunkModel:GetAttribute("Biome")
     end

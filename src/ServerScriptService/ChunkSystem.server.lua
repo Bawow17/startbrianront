@@ -7,6 +7,9 @@ local MemoryStoreService = game:GetService("MemoryStoreService")
 local HttpService = game:GetService("HttpService")
 local BiomeConfig = require(script.Parent:WaitForChild("ChunkBiomeConfig"))
 local DailyWorldCycle = require(script.Parent:WaitForChild("DailyWorldCycle"))
+local WorldStreamServer = require(script.Parent:WaitForChild("WorldStreamServer"))
+
+WorldStreamServer.init()
 
 local CHUNK_SIZE = 128
 local LOAD_RADIUS = 10
@@ -79,12 +82,12 @@ local LIGHT_SHARD_BASE_SEED = RNG_BASE_SEED + 13579
 local LIGHT_SHARD_SPAWN_INTERVAL = 0.5
 local LIGHT_SHARD_MAX_ACTIVE = 10000
 local LIGHT_SHARD_SPAWN_RADIUS_MIN_CHUNKS = 0
-local LIGHT_SHARD_SPAWN_RADIUS_MAX_CHUNKS = 3000
+local LIGHT_SHARD_SPAWN_RADIUS_MAX_CHUNKS = 300
 local LIGHT_SHARD_SPAWNS_PER_INTERVAL = 5
 local LIGHT_SHARD_VISIBILITY_RADIUS_CHUNKS = 10
-local LIGHT_SHARD_FORCE_VISIBILITY = true
+local LIGHT_SHARD_FORCE_VISIBILITY = false
 local LIGHT_SHARD_MIN_ALTITUDE = 175
-local LIGHT_SHARD_HORIZONTAL_DURATION = 200
+local LIGHT_SHARD_HORIZONTAL_DURATION = 30
 local LIGHT_SHARD_HORIZONTAL_SPEED = 45
 local LIGHT_SHARD_LAND_HEIGHT_OFFSET = 2
 local LIGHT_SHARD_LAND_DETECTION_TOLERANCE = 0.5
@@ -105,14 +108,27 @@ local function locateTemplatesRoot()
     return ServerStorage:FindFirstChild(TEMPLATE_ROOT_NAME) or Workspace:FindFirstChild(TEMPLATE_ROOT_NAME)
 end
 
-local templatesRoot = locateTemplatesRoot()
+local function getRelativeTemplatePath(root, descendant)
+    if not root or not descendant then
+        return nil
+    end
 
-local chunksFolder = Workspace:FindFirstChild("GeneratedChunks")
-if not chunksFolder then
-    chunksFolder = Instance.new("Folder")
-    chunksFolder.Name = "GeneratedChunks"
-    chunksFolder.Parent = Workspace
+    local segments = {}
+    local current = descendant
+    while current and current ~= root do
+        table.insert(segments, 1, current.Name)
+        current = current.Parent
+    end
+
+    if current ~= root then
+        return descendant.Name
+    end
+
+    table.insert(segments, 1, root.Name)
+    return table.concat(segments, "/")
 end
+
+local templatesRoot = locateTemplatesRoot()
 
 local lightShardFolder = Workspace:FindFirstChild("LightShards")
 if not lightShardFolder then
@@ -122,8 +138,6 @@ if not lightShardFolder then
 end
 
 local spawnLocationCache
-local raycastGround
-
 local function clearArray(list)
     for index = #list, 1, -1 do
         list[index] = nil
@@ -471,31 +485,6 @@ local function updateCentralGroundColors()
     local targetColor = getBiomeSurfaceColor(centralBiomeName)
 
     if not targetColor then
-        local centralChunk = chunksFolder:FindFirstChild("Chunk_1_0") or chunksFolder:FindFirstChild("Chunk_0_1")
-        if not centralChunk then
-            for _, model in ipairs(chunksFolder:GetChildren()) do
-                if model:GetAttribute("Biome") == centralBiomeName then
-                    centralChunk = model
-                    break
-                end
-            end
-        end
-
-        if centralChunk then
-            for _, child in ipairs(centralChunk:GetChildren()) do
-                if child:IsA("BasePart") and child ~= centralChunk.PrimaryPart then
-                    targetColor = child.Color
-                    break
-                end
-            end
-
-            if not targetColor and centralChunk.PrimaryPart then
-                targetColor = centralChunk.PrimaryPart.Color
-            end
-        end
-    end
-
-    if not targetColor then
         return
     end
 
@@ -555,6 +544,7 @@ local loadedChunks = {}
 local playerChunkPositions = {}
 local lightShardSchedule = {}
 local activeLightShards = {}
+local chunkDecorationRecords = {}
 local lightShardLastScheduledOrdinal = -1
 local lightShardCenterChunkX = 0
 local lightShardCenterChunkZ = 0
@@ -657,6 +647,20 @@ local function chooseChunkHeight(cx, cz)
     return chosen
 end
 
+local function getChunkHeight(cx, cz)
+    local key = chunkKey(cx, cz)
+    local height = chunkHeights[key]
+    if height ~= nil then
+        return height
+    end
+    return chooseChunkHeight(cx, cz)
+end
+
+local function getChunkGroundHeightAt(position)
+    local cx, cz = worldToChunk(position)
+    return getChunkHeight(cx, cz)
+end
+
 local function seededRandom(seed, cx, cz)
     return Random.new(seed + cx * PRIME_X + cz * PRIME_Z)
 end
@@ -686,11 +690,17 @@ local function getTemplatesForPath(path)
         if node:IsA("Folder") then
             for _, child in ipairs(node:GetChildren()) do
                 if child:IsA("Model") then
-                    table.insert(models, child)
+                    table.insert(models, {
+                        instance = child,
+                        templatePath = string.format("%s/%s/%s", TEMPLATE_ROOT_NAME, path, child.Name),
+                    })
                 end
             end
         elseif node:IsA("Model") then
-            table.insert(models, node)
+            table.insert(models, {
+                instance = node,
+                templatePath = string.format("%s/%s", TEMPLATE_ROOT_NAME, path),
+            })
         end
     end
 
@@ -698,11 +708,12 @@ local function getTemplatesForPath(path)
     return models
 end
 
-local function scatterModels(chunkModel, centerPosition, config, targetPosition)
+local function scatterModels(chunkContext, centerPosition, config, targetPosition, recordList)
     local templates = config.templates
     if not templates then
         if config.templatePath then
             templates = getTemplatesForPath(config.templatePath)
+            config.templates = templates
         end
     end
 
@@ -710,7 +721,10 @@ local function scatterModels(chunkModel, centerPosition, config, targetPosition)
         return
     end
 
-    local randomSource = config.seed and seededRandom(config.seed, chunkModel:GetAttribute("ChunkX") or 0, chunkModel:GetAttribute("ChunkZ") or 0) or rng
+    local chunkX = chunkContext and chunkContext.chunkX or 0
+    local chunkZ = chunkContext and chunkContext.chunkZ or 0
+    local chunkBiome = chunkContext and chunkContext.biome or nil
+    local randomSource = config.seed and seededRandom(config.seed, chunkX, chunkZ) or rng
 
     local desiredCount = randomSource:NextInteger(config.countMin, config.countMax)
     local placedPositions = {}
@@ -719,67 +733,41 @@ local function scatterModels(chunkModel, centerPosition, config, targetPosition)
     local maxAttempts = desiredCount * 15
     local halfSize = CHUNK_SIZE * 0.5 - (config.edgeMargin or 0)
 
-    local function isBlocked(instance)
-        local ancestor = instance:FindFirstAncestorWhichIsA("Model")
-        if not ancestor then
-            return false
-        end
-
-        if config.blockAttribute and ancestor:GetAttribute(config.blockAttribute) then
-            return true
-        end
-
-        if config.blockAttributes then
-            for attrName in pairs(config.blockAttributes) do
-                if ancestor:GetAttribute(attrName) then
-                    return true
-                end
-            end
-        end
-
-        return false
-    end
-
-    local rayParams = RaycastParams.new()
-    rayParams.FilterType = Enum.RaycastFilterType.Include
-    rayParams.FilterDescendantsInstances = { chunkModel }
-    rayParams.IgnoreWater = false
-
     while #placedPositions < desiredCount and attempts < maxAttempts do
         attempts += 1
 
         local offsetX = randomSource:NextNumber(-halfSize, halfSize)
         local offsetZ = randomSource:NextNumber(-halfSize, halfSize)
 
-        local origin = Vector3.new(centerPosition.X + offsetX, centerPosition.Y + 200, centerPosition.Z + offsetZ)
-        local direction = Vector3.new(0, -400, 0)
-        local result = Workspace:Raycast(origin, direction, rayParams)
+        local worldX = centerPosition.X + offsetX
+        local worldZ = centerPosition.Z + offsetZ
+        local heightSample = getChunkGroundHeightAt(Vector3.new(worldX, centerPosition.Y, worldZ))
+        local position = Vector3.new(worldX, heightSample, worldZ)
+        local position2D = Vector2.new(worldX, worldZ)
+        local tooClose = false
 
-        if result and not isBlocked(result.Instance) then
-            local position2D = Vector2.new(result.Position.X, result.Position.Z)
-            local tooClose = false
-
-            for _, pos in ipairs(placedPositions) do
-                if (pos - position2D).Magnitude < config.minSpacing then
-                    tooClose = true
-                    break
-                end
+        for _, pos in ipairs(placedPositions) do
+            if (pos - position2D).Magnitude < config.minSpacing then
+                tooClose = true
+                break
             end
+        end
 
-            if not tooClose then
-                local template = templates[randomSource:NextInteger(1, #templates)]
-                local rotation = randomSource:NextNumber(0, math.pi * 2)
-                local distSq = targetPosition and (targetPosition - result.Position).Magnitude ^ 2 or 0
+        if not tooClose then
+            local templateEntry = templates[randomSource:NextInteger(1, #templates)]
+            local template = templateEntry.instance
+            local rotation = randomSource:NextNumber(0, math.pi * 2)
+            local distSq = targetPosition and (targetPosition - position).Magnitude ^ 2 or 0
 
-                table.insert(placements, {
-                    template = template,
-                    position = result.Position,
-                    rotation = rotation,
-                    distSq = distSq,
-                })
+            table.insert(placements, {
+                template = template,
+                templatePath = templateEntry.templatePath,
+                position = position,
+                rotation = rotation,
+                distSq = distSq,
+            })
 
-                table.insert(placedPositions, position2D)
-            end
+            table.insert(placedPositions, position2D)
         end
     end
 
@@ -788,26 +776,25 @@ local function scatterModels(chunkModel, centerPosition, config, targetPosition)
     end)
 
     for _, placement in ipairs(placements) do
-        local clone = placement.template:Clone()
-        clone:SetAttribute(config.attributeName, true)
-
-        for _, descendant in ipairs(clone:GetDescendants()) do
-            if descendant:IsA("BasePart") then
-                descendant.Anchored = true
-                descendant.CanCollide = config.collidable ~= false
-            end
-        end
-
-        local basePivot = clone:GetPivot()
+        local basePivot = placement.template and placement.template:GetPivot() or CFrame.new()
         local rotationCF = CFrame.Angles(0, placement.rotation, 0)
-
         local xVector = rotationCF:VectorToWorldSpace(basePivot.XVector)
         local yVector = rotationCF:VectorToWorldSpace(basePivot.YVector)
         local zVector = rotationCF:VectorToWorldSpace(basePivot.ZVector)
-
         local finalCFrame = CFrame.fromMatrix(placement.position - Vector3.new(0, 0.1, 0), xVector, yVector, zVector)
-        clone:PivotTo(finalCFrame)
-        clone.Parent = chunkModel
+
+        if recordList then
+            table.insert(recordList, {
+                attribute = config.attributeName,
+                template = placement.template and placement.template.Name or "Unknown",
+                templatePath = placement.templatePath,
+                cframe = finalCFrame,
+                position = placement.position,
+                rotation = placement.rotation,
+                biome = chunkBiome,
+                collidable = config.collidable ~= false,
+            })
+        end
     end
 end
 
@@ -907,71 +894,6 @@ local biomeDecorations = {
     },
 }
 
-local decorationAttributeMap = {}
-for _, configs in pairs(biomeDecorations) do
-    for _, config in ipairs(configs) do
-        if config.attributeName then
-            decorationAttributeMap[config.attributeName] = true
-        end
-    end
-end
-
-local function isDecorationInstance(instance)
-    if not instance then
-        return false
-    end
-    local current = instance
-    while current and current ~= Workspace do
-        for attributeName in pairs(decorationAttributeMap) do
-            if current:GetAttribute(attributeName) then
-                return true
-            end
-        end
-        current = current.Parent
-    end
-    return false
-end
-
-local function _raycastGround(position, additionalIgnore)
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.IgnoreWater = false
-
-    local ignore = {}
-    if lightShardFolder then
-        table.insert(ignore, lightShardFolder)
-    end
-    if additionalIgnore then
-        if typeof(additionalIgnore) == "Instance" then
-            table.insert(ignore, additionalIgnore)
-        elseif typeof(additionalIgnore) == "table" then
-            for _, inst in ipairs(additionalIgnore) do
-                table.insert(ignore, inst)
-            end
-        end
-    end
-
-    local origin = Vector3.new(position.X, position.Y + 2000, position.Z)
-    local direction = Vector3.new(0, -4000, 0)
-
-    for _ = 1, 16 do
-        params.FilterDescendantsInstances = ignore
-        local result = Workspace:Raycast(origin, direction, params)
-        if not result then
-            break
-        end
-
-        if isDecorationInstance(result.Instance) then
-            table.insert(ignore, result.Instance)
-        else
-            return result.Position
-        end
-    end
-
-    return nil
-end
-raycastGround = _raycastGround
-
 local function resolveShardLandingPosition(shard)
     if shard.landingPosition and shard.landingPositionAccurate then
         return shard.landingPosition
@@ -982,15 +904,9 @@ local function resolveShardLandingPosition(shard)
     local travel = shard.horizontalDirection * shard.horizontalSpeed * travelDuration
     local referencePosition = basePosition + travel
 
-    local hit = raycastGround(referencePosition)
-    if hit then
-        shard.landingPosition = hit
-        shard.landingPositionAccurate = true
-        return shard.landingPosition
-    end
-
-    shard.landingPosition = Vector3.new(referencePosition.X, WORLD_ORIGIN.Y, referencePosition.Z)
-    shard.landingPositionAccurate = false
+    local groundHeight = getChunkGroundHeightAt(referencePosition)
+    shard.landingPosition = Vector3.new(referencePosition.X, groundHeight, referencePosition.Z)
+    shard.landingPositionAccurate = true
     return shard.landingPosition
 end
 
@@ -1057,6 +973,10 @@ local function resetLightShardState()
 
     if lightShardFolder then
         lightShardFolder:ClearAllChildren()
+    end
+
+    if WorldStreamServer.isEnabled() then
+        WorldStreamServer.resetShards()
     end
 end
 
@@ -1294,6 +1214,12 @@ local function setInFlightVFXEnabled(instance, enabled)
 end
 
 local function spawnLightShardInstance(shard)
+    if WorldStreamServer.isEnabled() then
+        return {
+            model = nil,
+        }
+    end
+
     local template = getLightShardTemplate(shard and shard.templateName)
     if not template then
         return nil
@@ -1353,10 +1279,42 @@ local function destroyLightShardInstance(identifier)
     end
 
     activeLightShards[identifier] = nil
+    if WorldStreamServer.isEnabled() then
+        WorldStreamServer.removeShard(identifier)
+    end
     return true
 end
 
+local function streamShardState(shard, evaluation)
+    if not WorldStreamServer.isEnabled() then
+        return
+    end
+    if not shard or not evaluation then
+        return
+    end
+
+    local payload = {
+        id = shard.id,
+        state = evaluation.state,
+        position = evaluation.position,
+        direction = evaluation.direction,
+        rarity = shard.rarity or "Common",
+        templateName = shard.templateName or LIGHT_SHARD_MODEL_NAME,
+        templatePath = string.format("%s/%s", LIGHT_SHARD_TEMPLATE_FOLDER_NAME, shard.templateName or LIGHT_SHARD_MODEL_NAME),
+        spawnPosition = shard.spawnPosition,
+        spawnOffset = shard.spawnOffset,
+        landingPosition = shard.landingPosition or resolveShardLandingPosition(shard),
+        horizontalSpeed = shard.horizontalSpeed,
+        horizontalDirection = shard.horizontalDirection,
+        descentSpeed = shard.descentSpeed,
+    }
+
+    WorldStreamServer.setShardState(shard.id, payload)
+end
+
 local function updateLightShardInstanceTransform(shard, instance, evaluation)
+    streamShardState(shard, evaluation)
+
     if not instance or not instance.model then
         return
     end
@@ -1381,10 +1339,10 @@ local function updateLightShardInstanceTransform(shard, instance, evaluation)
     else
         planarDirection = planarDirection.Unit
     end
-    local forward = direction.Unit
     local baseCFrame = CFrame.lookAt(
         evaluation.position,
-        evaluation.position + forward
+        evaluation.position + planarDirection,
+        Vector3.yAxis
     )
     local pivotCFrame = baseCFrame * CFrame.Angles(math.rad(90), 0, 0)
     instance.model:PivotTo(pivotCFrame)
@@ -1526,17 +1484,35 @@ local function updateLightShards(dt)
     end
 end
 
-local function decorateChunk(chunkModel, cx, cz, centerPosition, biomeName, targetPosition)
+local function decorateChunk(cx, cz, centerPosition, biomeName, targetPosition)
     local configs = biomeDecorations[biomeName]
     if not configs then
+        if WorldStreamServer.isEnabled() then
+            local key = chunkKey(cx, cz)
+            chunkDecorationRecords[key] = {}
+            WorldStreamServer.setDecorationState(key, {})
+        end
         return
     end
 
-    chunkModel:SetAttribute("ChunkX", chunkModel:GetAttribute("ChunkX") or cx)
-    chunkModel:SetAttribute("ChunkZ", chunkModel:GetAttribute("ChunkZ") or cz)
+    local decorationRecords
+    if WorldStreamServer.isEnabled() then
+        decorationRecords = {}
+        chunkDecorationRecords[chunkKey(cx, cz)] = decorationRecords
+    end
+
+    local chunkContext = {
+        chunkX = cx,
+        chunkZ = cz,
+        biome = biomeName,
+    }
 
     for _, config in ipairs(configs) do
-        scatterModels(chunkModel, centerPosition, config, targetPosition)
+        scatterModels(chunkContext, centerPosition, config, targetPosition, decorationRecords)
+    end
+
+    if decorationRecords then
+        WorldStreamServer.setDecorationState(chunkKey(cx, cz), decorationRecords)
     end
 end
 
@@ -1583,31 +1559,34 @@ local function spawnChunk(cx, cz, sourcePosition)
     end
 
     local height = chooseChunkHeight(cx, cz)
-
-    local clone = template:Clone()
-    clone.Name = string.format("Chunk_%d_%d", cx, cz)
+    local templatePath = getRelativeTemplatePath(templatesRoot, template)
     local biomeName = biome and biome.name or nil
-    if biomeName then
-        clone:SetAttribute("Biome", biomeName)
-    end
-    clone:SetAttribute("ChunkX", cx)
-    clone:SetAttribute("ChunkZ", cz)
-
     local center = chunkCenterWorldPosition(cx, cz, height)
-    clone:PivotTo(CFrame.new(center))
-    clone.Parent = chunksFolder
 
     loadedChunks[key] = {
-        model = clone,
+        model = nil,
         height = height,
         biome = biomeName,
         center = center,
         chunkX = cx,
         chunkZ = cz,
+        templatePath = templatePath,
     }
 
+    if WorldStreamServer.isEnabled() then
+        WorldStreamServer.setChunkState(key, {
+            chunkX = cx,
+            chunkZ = cz,
+            height = height,
+            center = center,
+            biome = biomeName,
+            templateName = template.Name,
+            templatePath = templatePath,
+        })
+    end
+
     if biomeName then
-        decorateChunk(clone, cx, cz, center, biomeName, sourcePosition)
+        decorateChunk(cx, cz, center, biomeName, sourcePosition)
     end
 
     if biomeName == centralBiomeName and cx == 1 and cz == 0 then
@@ -1625,6 +1604,13 @@ local function unloadChunk(key)
         data.model:Destroy()
     end
 
+    chunkDecorationRecords[key] = nil
+
+    if WorldStreamServer.isEnabled() then
+        WorldStreamServer.removeChunk(key)
+        WorldStreamServer.removeDecorationState(key)
+    end
+
     loadedChunks[key] = nil
 end
 
@@ -1633,12 +1619,14 @@ local function clearAllChunks()
         unloadChunk(key)
     end
     loadedChunks = {}
+    chunkDecorationRecords = {}
 end
 
 local function resetChunkState()
     chunkHeights = {}
     chunkHeights[chunkKey(0, 0)] = WORLD_ORIGIN.Y
     templateCache = {}
+    chunkDecorationRecords = {}
 end
 
 local function applyCycleState(cycleState, isInitial)
