@@ -5,14 +5,14 @@ local LightSystemConfig = {
 
     -- Tuning knobs
     BaseMaxLight = 100, -- Hook: apply future upgrade multipliers to this base value.
-    BaseDrainPerSecond = 10,
+    BaseDrainPerSecond = 0.7,
     RegenPerSecond = 33.33,
     ValidationInterval = 0.5,
-    HealthDrainPercentPerSecondAtZero = 4, -- Percent of max health drained per second when light is empty.
+    HealthDrainPercentPerSecondAtZero = 5, -- Percent of max health drained per second when light is empty.
 
     -- Lighting visuals
     FullBrightness = 0.3,
-    LightRange = 35,
+    LightRange = 45,
     ShadowsEnabled = true,
 
     -- World layout (mirrors ChunkSystem settings)
