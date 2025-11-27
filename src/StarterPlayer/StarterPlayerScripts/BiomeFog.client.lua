@@ -23,12 +23,12 @@ workspace:GetAttributeChangedSignal("CentralBiomeRadius"):Connect(updateCentralR
 local biomeFogSettings = {
     Flatlands = {
         color = Color3.fromRGB(100, 255, 83),
-        fogEnd = 2000,
+        fogEnd = 3800,
         fogStart = 450,
     },
     Forest = {
         color = Color3.fromRGB(30, 255, 37),
-        fogEnd = 1800,
+        fogEnd = 3600,
         fogStart = 400,
     },
     Desert = {
@@ -38,12 +38,12 @@ local biomeFogSettings = {
     },
     Swamp = {
         color = Color3.fromRGB(12, 31, 10),
-        fogEnd = 990,
+        fogEnd = 3300,
         fogStart = 140,
     },
     Tundra = {
         color = Color3.fromRGB(255, 255, 255),
-        fogEnd = 830,
+        fogEnd = 3400,
         fogStart = 95,
     },
 }
