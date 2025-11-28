@@ -2,12 +2,14 @@ local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
 local ServerStorage = game:GetService("ServerStorage")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local DataStoreService = game:GetService("DataStoreService")
 local MemoryStoreService = game:GetService("MemoryStoreService")
 local HttpService = game:GetService("HttpService")
 local BiomeConfig = require(script.Parent:WaitForChild("ChunkBiomeConfig"))
 local DailyWorldCycle = require(script.Parent:WaitForChild("DailyWorldCycle"))
 local WorldStreamServer = require(script.Parent:WaitForChild("WorldStreamServer"))
+local LightConfig = require(ReplicatedStorage:WaitForChild("LightSystemConfig"))
 
 WorldStreamServer.init()
 
@@ -91,7 +93,7 @@ local LIGHT_SHARD_HORIZONTAL_DURATION = 30
 local LIGHT_SHARD_HORIZONTAL_SPEED = 45
 local LIGHT_SHARD_LAND_HEIGHT_OFFSET = 2
 local LIGHT_SHARD_LAND_DETECTION_TOLERANCE = 0.5
-local LIGHT_SHARD_LIFETIME_AFTER_LAND = 10
+local LIGHT_SHARD_LIFETIME_AFTER_LAND = 120
 local LIGHT_SHARD_DEBUG = false
 
 local TEMPLATE_ROOT_NAME = BiomeConfig.TemplateRootName or "ChunkTemplates"
@@ -135,6 +137,19 @@ if not lightShardFolder then
     lightShardFolder = Instance.new("Folder")
     lightShardFolder.Name = "LightShards"
     lightShardFolder.Parent = Workspace
+end
+
+local lightRemotes = ReplicatedStorage:FindFirstChild(LightConfig.RemoteFolderName)
+if not lightRemotes then
+    lightRemotes = Instance.new("Folder")
+    lightRemotes.Name = LightConfig.RemoteFolderName
+    lightRemotes.Parent = ReplicatedStorage
+end
+local lightBonusBindable = lightRemotes:FindFirstChild(LightConfig.LightBonusBindableName)
+if not lightBonusBindable then
+    lightBonusBindable = Instance.new("BindableEvent")
+    lightBonusBindable.Name = LightConfig.LightBonusBindableName
+    lightBonusBindable.Parent = lightRemotes
 end
 
 local spawnLocationCache
@@ -1214,10 +1229,23 @@ local function setInFlightVFXEnabled(instance, enabled)
 end
 
 local function spawnLightShardInstance(shard)
+    -- If streaming is enabled, avoid duplicating visuals; create an invisible anchor for prompts only.
     if WorldStreamServer.isEnabled() then
-        return {
-            model = nil,
-        }
+        local model = Instance.new("Model")
+        model.Name = string.format("LightShard_%d", shard.id)
+        local anchor = Instance.new("Part")
+        anchor.Name = "Anchor"
+        anchor.Anchored = true
+        anchor.CanCollide = false
+        anchor.CanTouch = false
+        anchor.CanQuery = false
+        anchor.Transparency = 1
+        anchor.Size = Vector3.new(2, 2, 2)
+        anchor.Parent = model
+        model.PrimaryPart = anchor
+        model:SetAttribute("LightShardId", shard.id)
+        model.Parent = lightShardFolder
+        return { model = model }
     end
 
     local template = getLightShardTemplate(shard and shard.templateName)
@@ -1266,6 +1294,177 @@ local function spawnLightShardInstance(shard)
     }
     setInFlightVFXEnabled(instanceData, true)
     return instanceData
+end
+
+local function findPrimary(model)
+    if not model then
+        return nil
+    end
+    if model.PrimaryPart then
+        return model.PrimaryPart
+    end
+    for _, descendant in ipairs(model:GetDescendants()) do
+        if descendant:IsA("BasePart") then
+            return descendant
+        end
+    end
+    return nil
+end
+
+local function shrinkModel(model, scale)
+    if not model or scale <= 0 then
+        return
+    end
+    if model.ScaleTo then
+        local ok = pcall(function()
+            model:ScaleTo(scale)
+        end)
+        if ok then
+            return
+        end
+    end
+    for _, part in ipairs(model:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.Size = part.Size * scale
+        end
+    end
+end
+
+local function disableVFX(descendant)
+    if descendant:IsA("ParticleEmitter") or descendant:IsA("Beam") or descendant:IsA("Trail") then
+        descendant.Enabled = false
+    elseif descendant:IsA("PointLight") or descendant:IsA("SpotLight") or descendant:IsA("SurfaceLight") then
+        descendant.Enabled = false
+    end
+end
+
+local function buildShardTool(shard)
+    if not shard then
+        return nil
+    end
+
+    local template = getLightShardTemplate(shard and shard.templateName)
+    if not template then
+        return nil
+    end
+
+    local model = template:Clone()
+    shrinkModel(model, 0.5)
+    local primary = findPrimary(model)
+
+    local tool = Instance.new("Tool")
+    tool.Name = string.format("%s Shard", shard.rarity or "Shard")
+    tool.CanBeDropped = true
+    tool.RequiresHandle = false -- keep false to avoid handle enforcement issues
+    tool:SetAttribute("ShardId", shard.id)
+    tool:SetAttribute("ShardTemplate", shard.templateName or "")
+    tool:SetAttribute("ShardRarity", shard.rarity or "Common")
+
+    local handle = Instance.new("Part")
+    handle.Name = "Handle"
+    handle.Size = (primary and (primary.Size * 0.5)) or Vector3.new(1, 1, 1)
+    handle.Transparency = 1
+    handle.CanCollide = false
+    handle.Anchored = false
+    handle.CFrame = primary and primary.CFrame or CFrame.new()
+    handle.Parent = tool
+
+    for _, part in ipairs(model:GetDescendants()) do
+        disableVFX(part)
+        if part:IsA("BasePart") then
+            part.Anchored = false
+            part.CanCollide = false
+            part.CanTouch = false
+            part.CanQuery = false
+            part.Parent = tool
+            if part ~= handle then
+                local weld = Instance.new("WeldConstraint")
+                weld.Part0 = handle
+                weld.Part1 = part
+                weld.Parent = handle
+            end
+        end
+    end
+
+    local finalHandle = tool:FindFirstChild("Handle") or handle
+    finalHandle.Name = "Handle"
+    finalHandle.Parent = tool
+    -- Leave RequiresHandle false to prevent Tool errors if Handle replication is delayed.
+
+    model:Destroy()
+    return tool
+end
+
+local function giveShardToPlayer(shard, instance, player)
+    if not shard or not player then
+        return
+    end
+
+    local backpack = player:FindFirstChildOfClass("Backpack")
+    if not backpack then
+        return
+    end
+
+    if instance then
+        instance.collected = true
+    end
+
+    local tool = buildShardTool(shard)
+    if tool then
+        tool.Parent = backpack
+    end
+
+    if destroyLightShardInstance then
+        local removed = destroyLightShardInstance(shard.id)
+        if not removed and WorldStreamServer.isEnabled() then
+            WorldStreamServer.removeShard(shard.id)
+        end
+    elseif WorldStreamServer.isEnabled() then
+        WorldStreamServer.removeShard(shard.id)
+    end
+    if lightShardSchedule then
+        lightShardSchedule[shard.id] = nil
+    end
+
+    -- Apply light bonus based on rarity.
+    local rarity = shard.rarity or "Common"
+    local bonusMap = LightConfig.RarityLightBonusPercent or {}
+    local percent = bonusMap[rarity] or bonusMap.Default or 0
+    lightBonusBindable:Fire(player, percent)
+end
+
+local function attachPickupPrompt(shard, instance)
+    if not shard or not instance or not instance.model or instance.prompt then
+        return
+    end
+
+    local primary = findPrimary(instance.model)
+    if not primary then
+        return
+    end
+
+    local prompt = Instance.new("ProximityPrompt")
+    prompt.ActionText = "Collect"
+    prompt.ObjectText = string.format("%s Shard", shard.rarity or "Shard")
+    prompt.HoldDuration = 1.5
+    prompt.RequiresLineOfSight = false
+    prompt.MaxActivationDistance = 10
+    prompt.KeyboardKeyCode = Enum.KeyCode.E
+    prompt.Parent = primary
+
+    instance.prompt = prompt
+
+    prompt.Triggered:Connect(function(player)
+        if instance.collected then
+            return
+        end
+        prompt.Enabled = false
+        giveShardToPlayer(shard, instance, player)
+        if instance.model then
+            instance.model:Destroy()
+            activeLightShards[shard.id] = nil
+        end
+    end)
 end
 
 local function destroyLightShardInstance(identifier)
@@ -1328,6 +1527,7 @@ local function updateLightShardInstanceTransform(shard, instance, evaluation)
         end
         instance.lastPitch = 0
         instance.landed = shard.landingPositionAccurate
+        attachPickupPrompt(shard, instance)
         return
     end
 

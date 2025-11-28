@@ -20,7 +20,7 @@ local LightSystemConfig = {
     WorldOrigin = Vector3.new(7500, 7500, 7500),
     ChunkHeightTolerance = 750,
     FadeDelaySeconds = 3,
-    FadeStepsPerSecond = 10,
+    FadeStepsPerSecond = 10,    
 }
 
 return LightSystemConfig

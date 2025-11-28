@@ -25,6 +25,13 @@ if not broadcastEvent then
     broadcastEvent.Parent = remotesFolder
 end
 
+local bonusEvent = remotesFolder:FindFirstChild(Config.LightBonusBindableName)
+if not bonusEvent then
+    bonusEvent = Instance.new("BindableEvent")
+    bonusEvent.Name = Config.LightBonusBindableName
+    bonusEvent.Parent = remotesFolder
+end
+
 local WORLD_ORIGIN = Config.WorldOrigin
 local HEIGHT_TOLERANCE = Config.ChunkHeightTolerance
 local MAX_BASE = Config.BaseMaxLight
@@ -88,6 +95,22 @@ local function applyExpected(state, dt, inChunk, inRegen)
     return value
 end
 
+local function applyBonus(player, percent)
+    if not player then
+        return
+    end
+    local state = playerState[player]
+    if not state then
+        resetState(player)
+        state = playerState[player]
+    end
+    local maxLight = state.maxLight or MAX_BASE
+    local bonus = maxLight * math.max(0, percent or 0) * 0.01
+    state.light = math.clamp((state.light or 0) + bonus, 0, maxLight)
+    state.lastUpdate = os.clock()
+    broadcast(player, state.light, maxLight)
+end
+
 reportEvent.OnServerEvent:Connect(function(player, payload)
     if typeof(payload) ~= "table" then
         return
@@ -137,6 +160,10 @@ reportEvent.OnServerEvent:Connect(function(player, payload)
             end
         end
     end
+end)
+
+bonusEvent.Event:Connect(function(player, percent)
+    applyBonus(player, percent)
 end)
 
 Players.PlayerAdded:Connect(function(player)

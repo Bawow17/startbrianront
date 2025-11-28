@@ -11,6 +11,7 @@ local Config = require(ReplicatedStorage:WaitForChild("LightSystemConfig"))
 local remotesFolder = ReplicatedStorage:WaitForChild(Config.RemoteFolderName)
 local reportEvent = remotesFolder:WaitForChild(Config.ReportEventName)
 local broadcastEvent = remotesFolder:WaitForChild(Config.BroadcastEventName)
+local bonusEvent = remotesFolder:FindFirstChild(Config.LightBonusBindableName)
 
 local CHUNK_SIZE = Config.ChunkSize
 local WORLD_ORIGIN = Config.WorldOrigin
@@ -305,8 +306,19 @@ broadcastEvent.OnClientEvent:Connect(function(payload)
     local plr = Players:GetPlayerByUserId(userId)
     if plr then
         setLightRatio(plr, ratio)
+        if plr == player then
+            lightValue = math.clamp(amount, 0, max)
+            MAX_LIGHT = max
+        end
     end
 end)
+
+if bonusEvent and bonusEvent.Event then
+    bonusEvent.Event:Connect(function(percent)
+        local bonus = MAX_LIGHT * math.max(0, percent or 0) * 0.01
+        lightValue = math.clamp(lightValue + bonus, 0, MAX_LIGHT)
+    end)
+end
 
 local function getLocalRatio()
     return lightValue / math.max(1, MAX_LIGHT)

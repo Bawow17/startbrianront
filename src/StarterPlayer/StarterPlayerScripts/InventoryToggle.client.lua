@@ -3,6 +3,19 @@ local Players = game:GetService("Players")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
+local activeConnections = {}
+local retrying = false
+local connectToggle
+
+local function disconnectAll()
+    for _, conn in ipairs(activeConnections) do
+        if conn and conn.Connected then
+            conn:Disconnect()
+        end
+    end
+    table.clear(activeConnections)
+end
+
 local function waitForDescendant(parent, name, timeout)
     local elapsed = 0
     while parent and parent.Parent and elapsed < (timeout or 5) do
@@ -16,10 +29,24 @@ local function waitForDescendant(parent, name, timeout)
     return nil
 end
 
+local function scheduleRetry()
+    if retrying then
+        return
+    end
+    retrying = true
+    task.delay(1, function()
+        retrying = false
+        connectToggle()
+    end)
+end
+
 local function connectToggle()
+    disconnectAll()
+
     local screenGui = playerGui:FindFirstChild("IngameScreenGui") or playerGui:WaitForChild("IngameScreenGui", 5)
     if not screenGui then
         warn("[InventoryToggle] IngameScreenGui not found")
+        scheduleRetry()
         return
     end
 
@@ -28,6 +55,7 @@ local function connectToggle()
 
     if not toggleButton or not panel then
         warn("[InventoryToggle] Missing UI pieces. toggleButton:", toggleButton, "panel:", panel)
+        scheduleRetry()
         return
     end
 
@@ -38,9 +66,10 @@ local function connectToggle()
         panel.Visible = open
     end
 
-    toggleButton.MouseButton1Click:Connect(function()
+    local conn = toggleButton.Activated:Connect(function()
         setOpen(not isOpen)
     end)
+    table.insert(activeConnections, conn)
 
     -- Also wire up any close/X buttons inside the panel by common names.
     for _, descendant in ipairs(panel:GetDescendants()) do
@@ -57,12 +86,23 @@ local function connectToggle()
                 or string.find(lowerText, "close")
 
             if isClose then
-                descendant.Activated:Connect(function()
+                local conn = descendant.Activated:Connect(function()
                     setOpen(false)
                 end)
+                table.insert(activeConnections, conn)
             end
         end
     end
 end
 
 connectToggle()
+
+playerGui.ChildAdded:Connect(function(child)
+    if child.Name == "IngameScreenGui" then
+        task.defer(connectToggle)
+    end
+end)
+
+player.CharacterAdded:Connect(function()
+    task.defer(connectToggle)
+end)
