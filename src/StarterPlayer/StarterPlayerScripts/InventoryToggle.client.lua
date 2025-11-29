@@ -36,7 +36,9 @@ local function scheduleRetry()
     retrying = true
     task.delay(1, function()
         retrying = false
-        connectToggle()
+        if connectToggle then
+            connectToggle()
+        end
     end)
 end
 

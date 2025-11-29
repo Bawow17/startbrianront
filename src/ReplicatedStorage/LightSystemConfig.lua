@@ -2,6 +2,7 @@ local LightSystemConfig = {
     RemoteFolderName = "LightSystemRemotes",
     ReportEventName = "LightReport",
     BroadcastEventName = "LightBroadcast",
+    LightBonusBindableName = "LightBonus",
 
     -- Tuning knobs
     BaseMaxLight = 100, -- Hook: apply future upgrade multipliers to this base value.
@@ -20,7 +21,18 @@ local LightSystemConfig = {
     WorldOrigin = Vector3.new(7500, 7500, 7500),
     ChunkHeightTolerance = 750,
     FadeDelaySeconds = 3,
-    FadeStepsPerSecond = 10,    
+    FadeStepsPerSecond = 10,
+
+    -- Bonus light restore per rarity (percent of max light)
+    RarityLightBonusPercent = {
+        Common = 1,
+        Uncommon = 2,
+        Rare = 3,
+        Epic = 4,
+        Legendary = 5,
+        Mythical = 6,
+        Default = 1,
+    },
 }
 
 return LightSystemConfig
