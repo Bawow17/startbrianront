@@ -20,9 +20,6 @@ local lastState
 local starsPanel
 local starList
 local template
-local refreshState
-
-local function refreshState() end
 
 local function ensureUi()
     if starsPanel and starList and template then
@@ -44,7 +41,7 @@ local function ensureUi()
         local found = starList:FindFirstChild("StarItem")
         if found then
             template = found:Clone()
-            found:Destroy() -- remove the in-place template after saving
+            found:Destroy()
         end
     end
 
@@ -75,17 +72,8 @@ local function render(state)
         return
     end
 
-    local entries = {}
-    for starType, count in pairs(state.owned) do
-        for i = 1, count do
-            table.insert(entries, { starType = starType, count = 1 })
-        end
-    end
-    table.sort(entries, function(a, b)
-        return a.starType < b.starType
-    end)
-
-    for index, entry in ipairs(entries) do
+    -- state.owned is a list of entries: { id, starType, equipped }
+    for index, entry in ipairs(state.owned) do
         local card = template:Clone()
         card.Visible = true
         card.Name = "StarItem_" .. tostring(index)
@@ -93,7 +81,7 @@ local function render(state)
 
         local nameLabel = card:FindFirstChild("NameTextLabel", true)
         if nameLabel and nameLabel:IsA("TextLabel") then
-            nameLabel.Text = string.format("%s Star", entry.starType)
+            nameLabel.Text = string.format("%s Star", entry.starType or "Unknown")
         end
 
         local qty = card:FindFirstChild("QuantityTextLabel", true)
@@ -102,17 +90,9 @@ local function render(state)
         end
 
         local equippedLabel = card:FindFirstChild("EquippedLabel", true) or card:FindFirstChild("EquippedTextLabel", true)
-        local equippedCount = 0
-        if state.slots then
-            for _, v in pairs(state.slots) do
-                if v == entry.starType then
-                    equippedCount += 1
-                end
-            end
-        end
         if equippedLabel and equippedLabel:IsA("TextLabel") then
-            if equippedCount > 0 then
-                equippedLabel.Text = string.format("Equipped (%d)", equippedCount)
+            if entry.equipped then
+                equippedLabel.Text = "Equipped"
                 equippedLabel.Visible = true
             else
                 equippedLabel.Text = ""
@@ -123,29 +103,17 @@ local function render(state)
         local equipBtn = card:FindFirstChild("EquipTextButton", true)
         local unequipBtn = card:FindFirstChild("UnequipTextButton", true)
 
-        local available = math.max(0, (state.owned[entry.starType] or 0) - equippedCount)
         if equipBtn and equipBtn:IsA("TextButton") then
-            equipBtn.Visible = available > 0
-        end
-        if unequipBtn and unequipBtn:IsA("TextButton") then
-            unequipBtn.Visible = equippedCount > 0
-        end
-
-        if equipBtn and equipBtn:IsA("TextButton") then
+            equipBtn.Visible = not entry.equipped
             equipBtn.MouseButton1Click:Connect(function()
-                equipEvent:FireServer(entry.starType)
-                task.defer(function()
-                    refreshState()
-                end)
+                equipEvent:FireServer(entry.id or entry.starType)
             end)
         end
 
         if unequipBtn and unequipBtn:IsA("TextButton") then
+            unequipBtn.Visible = entry.equipped
             unequipBtn.MouseButton1Click:Connect(function()
-                unequipEvent:FireServer(entry.starType)
-                task.defer(function()
-                    refreshState()
-                end)
+                unequipEvent:FireServer(entry.id or entry.starType)
             end)
         end
     end

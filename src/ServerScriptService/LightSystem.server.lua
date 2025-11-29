@@ -159,6 +159,12 @@ reportEvent.OnServerEvent:Connect(function(player, payload)
                 humanoid:TakeDamage(damage)
             end
         end
+    elseif clamped >= maxLight then
+        local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+        if humanoid and humanoid.Health > 0 then
+            local healPerSecond = 0.10 * humanoid.MaxHealth
+            humanoid.Health = math.min(humanoid.MaxHealth, humanoid.Health + healPerSecond * dt)
+        end
     end
 end)
 

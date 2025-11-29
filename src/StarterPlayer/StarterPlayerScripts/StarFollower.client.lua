@@ -54,16 +54,12 @@ local function attachFollower(player, starType)
     local clone = template:Clone()
     scaleModel(clone, 0.33)
 
-    local function anchor(model)
-        for _, p in ipairs(model:GetDescendants()) do
-            if p:IsA("BasePart") then
-                p.Anchored = false
-                p.CanCollide = false
-            end
+    for _, p in ipairs(clone:GetDescendants()) do
+        if p:IsA("BasePart") then
+            p.Anchored = false
+            p.CanCollide = false
         end
     end
-
-    anchor(clone)
     clone.Name = string.format("%s_%sFollower", player.Name, starType)
     clone.Parent = workspace
 
@@ -71,26 +67,29 @@ local function attachFollower(player, starType)
     local function attachToCharacter(character)
         if conn then
             conn:Disconnect()
+            conn = nil
         end
         if not character then
             return
         end
-        local root = character:FindFirstChild("HumanoidRootPart")
-        if not root then
-            root = character:WaitForChild("HumanoidRootPart", 3)
-        end
+        local root = character:FindFirstChild("HumanoidRootPart") or character:WaitForChild("HumanoidRootPart", 3)
         if not root then
             return
         end
 
-        clone:PivotTo(root.CFrame * CFrame.new(0, 2, -2))
+        local offset = Vector3.new(-2, 2.5, 2.5)
+        local current = root.CFrame * CFrame.new(offset)
+        clone:PivotTo(current)
 
-        conn = RunService.Heartbeat:Connect(function()
+        conn = RunService.RenderStepped:Connect(function(dt)
             if not root.Parent then
                 cleanupFollower(player.UserId)
                 return
             end
-            clone:PivotTo(root.CFrame * CFrame.new(0, 2, -2))
+            local desired = root.CFrame * CFrame.new(offset)
+            local blend = 1 - math.exp(-8 * math.clamp(dt, 0, 1)) -- smooth, time-based
+            current = current:Lerp(desired, blend)
+            clone:PivotTo(current)
         end)
     end
 

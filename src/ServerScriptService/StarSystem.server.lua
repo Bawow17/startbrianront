@@ -94,6 +94,28 @@ local function compactSlots(s)
     end
 end
 
+-- Light-weight debug with simple rate limiting per player to avoid spam.
+local lastDebug = {}
+local function debugLog(player, force, ...)
+    local now = os.clock()
+    local key = player and player.UserId or 0
+    if not force then
+        if lastDebug[key] and now - lastDebug[key] < 1 then
+            return
+        end
+        lastDebug[key] = now
+    end
+    warn("[StarSystem]", player and player.Name or "server", ...)
+end
+
+local function slotsToString(slots)
+    local parts = {}
+    for i = 1, MAX_SLOTS do
+        parts[i] = slots[i] or "-"
+    end
+    return table.concat(parts, ",")
+end
+
 local function getPlayerBase(player)
     for _, base in ipairs(workspaceBasesFolder:GetChildren()) do
         if base:GetAttribute("ManagedByBaseOwnership") then
@@ -167,8 +189,16 @@ local function clearPrompts(player)
             end
         end
     end
+    if s and s.prompts then
+        for _, prompt in ipairs(s.prompts) do
+            if prompt and prompt.Parent then
+                prompt:Destroy()
+            end
+        end
+    end
     if s then
         s.promptConns = {}
+        s.prompts = {}
     end
 end
 
@@ -222,10 +252,12 @@ local function renderBaseDisplays(player)
     local anchors = collectAnchors(baseModel)
     s.displayModels = {}
     s.promptConns = s.promptConns or {}
-    for index, starType in ipairs(s.slots) do
+    s.prompts = s.prompts or {}
+    for index, starId in ipairs(s.slots) do
         local anchor = anchors[index]
-        if starType and anchor then
-            local promptStarType = starType
+        local entry = starId and s.ownedMap and s.ownedMap[starId]
+        local promptStarType = entry and entry.starType
+        if promptStarType and anchor then
             local model = cloneStarTemplate(promptStarType, 1)
             if model then
                 model.Parent = baseModel
@@ -249,12 +281,16 @@ local function renderBaseDisplays(player)
                         return
                     end
                     -- clear previous main and set new
-                    s.main = promptStarType
+                    s.mainId = starId
                     broadcastMain(plr)
                     broadcastState(plr)
+                    -- disable this prompt, but re-render will create fresh ones
                     prompt.Enabled = false
+                    debugLog(plr, true, "Main set to", promptStarType)
+                    renderBaseDisplays(plr)
                 end)
                 table.insert(s.promptConns, conn)
+                table.insert(s.prompts, prompt)
             end
         end
     end
@@ -264,7 +300,7 @@ function broadcastMain(player)
     local s = state[player]
     mainUpdate:FireAllClients({
         userId = player.UserId,
-        starType = s and s.main or nil,
+        starType = s and s.mainId and s.ownedMap[s.mainId] and s.ownedMap[s.mainId].starType or nil,
     })
 end
 
@@ -274,56 +310,57 @@ function broadcastState(player)
         return
     end
     stateUpdate:FireClient(player, {
-        owned = s.owned,
+        owned = s.ownedList,
         slots = s.slots,
-        main = s.main,
+        mainId = s.mainId,
     })
 end
 
 local function initPlayer(player)
     state[player] = {
-        owned = {},
+        ownedList = {},
+        ownedMap = {},
         slots = {},
         displayModels = {},
-        main = nil,
+        mainId = nil,
         promptConns = {},
+        prompts = {},
     }
     for _, t in ipairs(DEFAULT_STARS) do
-        state[player].owned[t] = 1
+        for i = 1, 3 do
+            local id = string.format("%s_%s_%d", t, player.UserId, i)
+            local entry = { id = id, starType = t, equipped = false }
+            table.insert(state[player].ownedList, entry)
+            state[player].ownedMap[id] = entry
+        end
     end
     renderBaseDisplays(player)
     broadcastMain(player)
     broadcastState(player)
 end
 
-local function destroyFollower(player)
-    mainUpdate:FireAllClients({
-        userId = player.UserId,
-        starType = nil,
-    })
-end
-
-local function equipStar(player, starType)
+local function equipStar(player, starId, starType)
     local s = state[player]
-    if not s or not starType then
+    if not s then
         return
     end
-    compactSlots(s)
-    local ownedCount = s.owned[starType] or 0
-    local equippedCount = 0
-    for _, v in pairs(s.slots) do
-        if v == starType then
-            equippedCount += 1
+    local entry = starId and s.ownedMap[starId]
+    if not entry then
+        for _, e in ipairs(s.ownedList) do
+            if not e.equipped and (not starType or e.starType == starType) then
+                entry = e
+                break
+            end
         end
     end
-    if equippedCount >= ownedCount then
+    if not entry or entry.equipped then
         return
     end
-    -- find first empty slot
     local placed = false
     for i = 1, MAX_SLOTS do
         if not s.slots[i] then
-            s.slots[i] = starType
+            s.slots[i] = entry.id
+            entry.equipped = true
             placed = true
             break
         end
@@ -331,39 +368,59 @@ local function equipStar(player, starType)
     if not placed then
         return
     end
+    debugLog(player, true, "Equipped", entry.starType, "slots:", slotsToString(s.slots))
     renderBaseDisplays(player)
     broadcastState(player)
 end
 
-local function unequipStar(player, starType)
+local function unequipStar(player, starId, starType)
     local s = state[player]
     if not s then
         return
     end
+    local removedId
     for i = MAX_SLOTS, 1, -1 do
-        if s.slots[i] == starType then
+        local id = s.slots[i]
+        local entry = id and s.ownedMap[id]
+        if id and entry and (starId == id or (starType and entry.starType == starType)) then
             s.slots[i] = nil
+            entry.equipped = false
+            removedId = id
             break
         end
     end
-    if s.main == starType then
-        s.main = nil
+    if not removedId then
+        debugLog(player, true, "Unequip requested but none found for", starType or starId or "?")
+        return
+    end
+    if s.mainId == removedId then
+        s.mainId = nil
         broadcastMain(player)
     end
-    compactSlots(s)
+    local packed = {}
+    for i = 1, MAX_SLOTS do
+        local id = s.slots[i]
+        if id then
+            table.insert(packed, id)
+        end
+    end
+    for i = 1, MAX_SLOTS do
+        s.slots[i] = packed[i]
+    end
+    debugLog(player, true, "Unequipped", starType or starId or "?", "slots:", slotsToString(s.slots))
     renderBaseDisplays(player)
     broadcastState(player)
 end
 
-local function setMain(player, starType)
+local function setMain(player, starId)
     local s = state[player]
     if not s then
         return
     end
-    if not starType or starType == "" then
-        s.main = nil
+    if not starId or not s.ownedMap[starId] then
+        s.mainId = nil
     else
-        s.main = starType
+        s.mainId = starId
     end
     broadcastMain(player)
 end
@@ -375,18 +432,18 @@ getStateFn.OnServerInvoke = function(player)
         s = state[player]
     end
     return {
-        owned = s.owned,
+        owned = s.ownedList,
         slots = s.slots,
-        main = s.main,
+        mainId = s.mainId,
     }
 end
 
-equipEvent.OnServerEvent:Connect(function(player, starType)
-    equipStar(player, starType)
+equipEvent.OnServerEvent:Connect(function(player, starIdOrType)
+    equipStar(player, starIdOrType, starIdOrType)
 end)
 
-unequipEvent.OnServerEvent:Connect(function(player, starType)
-    unequipStar(player, starType)
+unequipEvent.OnServerEvent:Connect(function(player, starIdOrType)
+    unequipStar(player, starIdOrType, starIdOrType)
 end)
 
 -- Main star is now chosen via proximity prompts on tube stars; ignore direct remote.

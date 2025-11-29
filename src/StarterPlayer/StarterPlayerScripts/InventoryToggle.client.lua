@@ -6,6 +6,7 @@ local playerGui = player:WaitForChild("PlayerGui")
 local activeConnections = {}
 local retrying = false
 local connectToggle
+local onPanelOpened
 
 local function disconnectAll()
     for _, conn in ipairs(activeConnections) do
@@ -45,15 +46,15 @@ end
 local function connectToggle()
     disconnectAll()
 
-    local screenGui = playerGui:FindFirstChild("IngameScreenGui") or playerGui:WaitForChild("IngameScreenGui", 5)
+    local screenGui = playerGui:FindFirstChild("IngameScreenGui") or playerGui:WaitForChild("IngameScreenGui", 2)
     if not screenGui then
         warn("[InventoryToggle] IngameScreenGui not found")
         scheduleRetry()
         return
     end
 
-    local toggleButton = waitForDescendant(screenGui, "InventoryToggle", 5)
-    local panel = waitForDescendant(screenGui, "InventoryPanel", 5)
+    local toggleButton = waitForDescendant(screenGui, "InventoryToggle", 2)
+    local panel = waitForDescendant(screenGui, "InventoryPanel", 2)
 
     if not toggleButton or not panel then
         warn("[InventoryToggle] Missing UI pieces. toggleButton:", toggleButton, "panel:", panel)
@@ -61,15 +62,28 @@ local function connectToggle()
         return
     end
 
-    local isOpen = panel.Visible
-
-    local function setOpen(open)
-        isOpen = open
-        panel.Visible = open
+local function setOpen(open)
+    panel.Visible = open
+    if open and onPanelOpened then
+        onPanelOpened("Inventory")
+        -- Close stars panel if open
+        local starsToggle = require(script.Parent:FindFirstChild("StarsToggle"))
+        if starsToggle and starsToggle.closePanel then
+            starsToggle.closePanel()
+        end
     end
+end
 
     local conn = toggleButton.Activated:Connect(function()
-        setOpen(not isOpen)
+        -- If Stars panel is open, close it before opening inventory
+        local screen = playerGui:FindFirstChild("IngameScreenGui")
+    if screen then
+        local starsPanel = screen:FindFirstChild("StarsPanel", true)
+        if starsPanel then
+            starsPanel.Visible = false
+        end
+    end
+        setOpen(not panel.Visible)
     end)
     table.insert(activeConnections, conn)
 
@@ -108,3 +122,24 @@ end)
 player.CharacterAdded:Connect(function()
     task.defer(connectToggle)
 end)
+
+player.CharacterRemoving:Connect(function()
+    disconnectAll()
+end)
+
+-- Expose a simple signal hook for cross-panel coordination
+return {
+    setOnPanelOpened = function(callback)
+        onPanelOpened = callback
+    end,
+    closePanel = function()
+        local screenGui = playerGui:FindFirstChild("IngameScreenGui")
+        if not screenGui then
+            return
+        end
+        local panel = waitForDescendant(screenGui, "InventoryPanel", 0.1)
+        if panel then
+            panel.Visible = false
+        end
+    end,
+}

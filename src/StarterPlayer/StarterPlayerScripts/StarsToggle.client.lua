@@ -1,10 +1,89 @@
 local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
+local Config = require(ReplicatedStorage:WaitForChild("LightSystemConfig"))
+local CHUNK_SIZE = Config.ChunkSize
+local WORLD_ORIGIN = Config.WorldOrigin
+local HEIGHT_TOLERANCE = Config.ChunkHeightTolerance
+
 local activeConnections = {}
 local retrying = false
+local connectToggle
+local onPanelOpened
+local inventoryToggle
+local starUiMod
+local toggleButtonRef
+local panelRef
+
+local function worldToChunk(position)
+    local dx = position.X - WORLD_ORIGIN.X
+    local dz = position.Z - WORLD_ORIGIN.Z
+    local cx = math.floor(dx / CHUNK_SIZE + 0.5)
+    local cz = math.floor(dz / CHUNK_SIZE + 0.5)
+    return cx, cz
+end
+
+local function locateChunkFolder()
+    local clientWorld = workspace:FindFirstChild("ClientWorld")
+    if clientWorld then
+        local clientChunks = clientWorld:FindFirstChild("ClientChunks")
+        if clientChunks then
+            return clientChunks
+        end
+    end
+    return workspace:FindFirstChild("GeneratedChunks")
+end
+
+local function chunkExists(cx, cz)
+    -- Treat origin/teleporter chunk as part of chunk world
+    if cx == 0 and cz == 0 then
+        return true
+    end
+    local folder = locateChunkFolder()
+    if not folder then
+        return false
+    end
+    local name = string.format("Chunk_%d_%d", cx, cz)
+    if folder:FindFirstChild(name) then
+        return true
+    end
+    -- fallback: check attributes if present
+    for _, child in ipairs(folder:GetChildren()) do
+        if child:GetAttribute("ChunkX") == cx and child:GetAttribute("ChunkZ") == cz then
+            return true
+        end
+    end
+    return false
+end
+
+local function isInChunkWorld(position)
+    if math.abs(position.Y - WORLD_ORIGIN.Y) > HEIGHT_TOLERANCE then
+        return false
+    end
+    local cx, cz = worldToChunk(position)
+    return chunkExists(cx, cz)
+end
+
+local function updateVisibility()
+    if not toggleButtonRef then
+        return
+    end
+    local character = player.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not root then
+        toggleButtonRef.Visible = true
+        return
+    end
+    local inChunk = isInChunkWorld(root.Position)
+    toggleButtonRef.Visible = not inChunk
+    if inChunk and panelRef then
+        panelRef.Visible = false
+    end
+end
 
 local function disconnectAll()
     for _, conn in ipairs(activeConnections) do
@@ -28,43 +107,61 @@ local function waitForDescendant(parent, name, timeout)
     return nil
 end
 
-local function scheduleRetry(connectFn)
+local function scheduleRetry()
     if retrying then
         return
     end
     retrying = true
     task.delay(1, function()
         retrying = false
-        connectFn()
+        if connectToggle then
+            connectToggle()
+        end
     end)
 end
 
-local function connectToggle()
+local function connectToggleInternal()
     disconnectAll()
 
-    local screenGui = playerGui:FindFirstChild("IngameScreenGui") or playerGui:WaitForChild("IngameScreenGui", 5)
+    local screenGui = playerGui:FindFirstChild("IngameScreenGui") or playerGui:WaitForChild("IngameScreenGui", 2)
     if not screenGui then
-        scheduleRetry(connectToggle)
+        scheduleRetry()
         return
     end
 
-    local toggleButton = waitForDescendant(screenGui, "StarsToggle", 5)
-    local panel = waitForDescendant(screenGui, "StarsPanel", 5)
+    local toggleButton = waitForDescendant(screenGui, "StarsToggle", 2)
+    local panel = waitForDescendant(screenGui, "StarsPanel", 2)
+    toggleButtonRef = toggleButton
+    panelRef = panel
 
     if not toggleButton or not panel then
-        scheduleRetry(connectToggle)
+        scheduleRetry()
         return
     end
 
-    local isOpen = panel.Visible
-
     local function setOpen(open)
-        isOpen = open
         panel.Visible = open
+        if open and onPanelOpened then
+            onPanelOpened("Stars")
+            if inventoryToggle and inventoryToggle.closePanel then
+                inventoryToggle.closePanel()
+            end
+            if starUiMod and starUiMod.refreshState then
+                starUiMod.refreshState()
+            end
+        end
     end
 
     local conn = toggleButton.Activated:Connect(function()
-        setOpen(not isOpen)
+        -- If Inventory panel is open, close it before opening stars
+        local screen = playerGui:FindFirstChild("IngameScreenGui")
+        if screen then
+            local invPanel = screen:FindFirstChild("InventoryPanel", true)
+            if invPanel then
+                invPanel.Visible = false
+            end
+        end
+        setOpen(not panel.Visible)
     end)
     table.insert(activeConnections, conn)
 
@@ -85,6 +182,7 @@ local function connectToggle()
     end
 end
 
+connectToggle = connectToggleInternal
 connectToggle()
 
 playerGui.ChildAdded:Connect(function(child)
@@ -96,3 +194,33 @@ end)
 player.CharacterAdded:Connect(function()
     task.defer(connectToggle)
 end)
+
+player.CharacterRemoving:Connect(function()
+    disconnectAll()
+end)
+
+RunService.Heartbeat:Connect(function()
+    updateVisibility()
+end)
+
+return {
+    setOnPanelOpened = function(callback)
+        onPanelOpened = callback
+    end,
+    closePanel = function()
+        local screenGui = playerGui:FindFirstChild("IngameScreenGui")
+        if not screenGui then
+            return
+        end
+        local panel = waitForDescendant(screenGui, "StarsPanel", 0.1)
+        if panel then
+            panel.Visible = false
+        end
+    end,
+    setInventoryToggle = function(mod)
+        inventoryToggle = mod
+    end,
+    setStarUi = function(mod)
+        starUiMod = mod
+    end,
+}
