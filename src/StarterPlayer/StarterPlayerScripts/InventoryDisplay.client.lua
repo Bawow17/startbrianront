@@ -37,6 +37,12 @@ local panel, inventoryList
 local template
 local lastData
 
+local function resetUiRefs()
+    panel = nil
+    inventoryList = nil
+    template = nil
+end
+
 local function buildFallbackTemplate()
     if not inventoryList then
         return nil
@@ -109,6 +115,7 @@ local function ensureUi()
 
     panel, inventoryList = locateUi()
     if not inventoryList then
+        warn("[InventoryDisplay] InventoryList not found")
         return false
     end
 
@@ -218,7 +225,7 @@ end)
 playerGui.ChildAdded:Connect(function(child)
     if child.Name == "IngameScreenGui" then
         task.defer(function()
-            if ensureUi() and lastData then
+            if ensureUi() then
                 renderInventory(lastData)
             end
         end)
@@ -227,7 +234,8 @@ end)
 
 Players.LocalPlayer.CharacterAdded:Connect(function()
     task.defer(function()
-        if ensureUi() and lastData then
+        resetUiRefs()
+        if ensureUi() then
             renderInventory(lastData)
         end
     end)

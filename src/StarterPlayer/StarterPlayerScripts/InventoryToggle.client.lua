@@ -48,7 +48,6 @@ local function connectToggle()
 
     local screenGui = playerGui:FindFirstChild("IngameScreenGui") or playerGui:WaitForChild("IngameScreenGui", 2)
     if not screenGui then
-        warn("[InventoryToggle] IngameScreenGui not found")
         scheduleRetry()
         return
     end

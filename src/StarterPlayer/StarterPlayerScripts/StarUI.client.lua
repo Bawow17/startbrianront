@@ -21,6 +21,13 @@ local starsPanel
 local starList
 local template
 
+local function resetUiRefs()
+    starsPanel = nil
+    starList = nil
+    template = nil
+    lastState = nil
+end
+
 local function ensureUi()
     if starsPanel and starList and template then
         return true
@@ -134,13 +141,17 @@ refreshState()
 playerGui.ChildAdded:Connect(function(child)
     if child.Name == "IngameScreenGui" then
         task.defer(function()
-            if lastState then
-                render(lastState)
-            else
-                refreshState()
-            end
+            resetUiRefs()
+            refreshState()
         end)
     end
+end)
+
+player.CharacterAdded:Connect(function()
+    task.defer(function()
+        resetUiRefs()
+        refreshState()
+    end)
 end)
 
 if stateUpdate then
